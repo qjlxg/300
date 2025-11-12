@@ -33,7 +33,7 @@ jobs:
       - name: 🐍 Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
+          python-version: '3.12'
 
       # 3. 安装依赖 (akshare, pandas-ta)
       - name: ⚙️ Install dependencies
