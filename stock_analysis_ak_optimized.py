@@ -1,4 +1,4 @@
-# stock_analysis_ak_optimized.py - 最终优化版（低并发、高重试）
+# stock_analysis_ak_optimized.py - 尝试切换数据源版（低并发、高重试）
 
 import akshare as ak
 import pandas as pd
@@ -15,9 +15,9 @@ OUTPUT_DIR = "index_data"
 DEFAULT_START_DATE = '20000101'
 INDICATOR_LOOKBACK_DAYS = 30 
 
-# 关键修改：降低并发数以减轻对数据源的压力
+# 保持低并发以减轻对数据源的压力
 MAX_WORKERS = 3 
-# 关键修改：最大重试次数增加
+# 最大重试次数
 MAX_RETRIES = 5 
 
 # 定义所有主要 A 股指数列表
@@ -89,7 +89,7 @@ def aggregate_and_analyze(df_raw_slice, freq, prefix):
          
     return agg_df
 
-# --- 增量数据获取与分析核心函数 (引入重试) ---
+# --- 增量数据获取与分析核心函数 (引入重试 + 切换数据源) ---
 
 def get_and_analyze_data_slice(symbol, start_date):
     """
@@ -102,11 +102,13 @@ def get_and_analyze_data_slice(symbol, start_date):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             # 1. 获取日线数据切片
+            # 关键修改：增加 adjust='hfq' 参数，尝试切换数据源
             df_raw = ak.index_zh_a_hist(
                 symbol=symbol, 
                 period="daily", 
                 start_date=start_date, 
-                end_date=end_date_str
+                end_date=end_date_str,
+                adjust="hfq"
             )
             
             # 成功获取，跳出重试循环
@@ -218,7 +220,7 @@ def main():
     print("---")
     
     # 2. 使用 ThreadPoolExecutor 进行并行处理
-    # 关键修改：使用更安全的 MAX_WORKERS = 3
+    # 关键：使用 MAX_WORKERS = 3
     
     futures = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -227,7 +229,6 @@ def main():
             futures.append(future)
 
     # 3. 收集结果
-    # 仅计算成功的任务
     successful_count = sum(f.result() for f in futures if f.result() is not None)
 
     print("---")
