@@ -1,4 +1,4 @@
-# stock_analysis_ak_production.py - 生产环境推荐版（logging + pathlib + 稳定串行）
+# stock_analysis_ak_production.py - 最终 EM 稳定版（logging + pathlib + 稳定串行）
 
 import akshare as ak
 import pandas as pd
@@ -21,14 +21,14 @@ shanghai_tz = pytz.timezone('Asia/Shanghai')
 OUTPUT_DIR = "index_data" 
 DEFAULT_START_DATE = '20000101'
 INDICATOR_LOOKBACK_DAYS = 30 
-LOCK_FILE = "stock_analysis.lock" # 增加锁文件
+LOCK_FILE = "stock_analysis.lock" 
 
 # 关键设置：保持串行，确保稳定运行
 MAX_WORKERS = 1 
 # 最大重试次数
-MAX_RETRIES = 5 
+MAX_RETRIES = 0 
 
-# 定义所有主要 A 股指数列表 (保持不变)
+# 定义所有主要 A 股指数列表
 INDEX_LIST = {
     '000001': '上证指数', '399001': '深证成指', '399006': '创业板指',
     '000016': '上证50', '000300': '沪深300', '000905': '中证500',
@@ -44,9 +44,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
     handlers=[
-        # 文件处理器，用于永久记录日志
         logging.FileHandler("stock_analysis.log", encoding='utf-8'),
-        # 标准输出处理器，用于 GitHub Actions 日志
         logging.StreamHandler()
     ]
 )
@@ -57,7 +55,6 @@ logger = logging.getLogger(__name__)
 
 def calculate_full_technical_indicators(df):
     """计算完整的技术指标集：MA, RSI, KDJ, MACD, BBANDS, ATR, CCI, OBV"""
-    # ... (函数体不变)
     if df.empty:
         return df
     
@@ -93,7 +90,7 @@ def calculate_full_technical_indicators(df):
 
 
 def aggregate_and_analyze(df_raw_slice, freq, prefix):
-    # ... (函数体不变)
+    """按频率聚合数据并计算指标"""
     if df_raw_slice.empty:
         return pd.DataFrame()
         
@@ -113,24 +110,23 @@ def aggregate_and_analyze(df_raw_slice, freq, prefix):
          
     return agg_df
 
-# --- 增量数据获取与分析核心函数 (使用 logging) ---
+# --- 增量数据获取与分析核心函数 (使用 EM 接口) ---
 
 def get_and_analyze_data_slice(symbol, start_date):
     """
-    使用 akshare 获取指定指数从 start_date 开始到最新的数据，并进行完整分析。
+    使用 akshare 的东方财富接口 (index_em_hist) 获取数据。
     """
     end_date_str = datetime.now(shanghai_tz).strftime('%Y%m%d')
-    logger.info(f"   - 正在获取 {symbol} 从 {start_date} 开始的数据...")
+    logger.info(f"   - 正在获取 {symbol} (EM 接口) 从 {start_date} 开始的数据...")
 
-    # 增加重试逻辑
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            # 1. 获取日线数据切片
-            df_raw = ak.index_zh_a_hist(
+            # 1. 【关键修改】：使用东方财富接口 ak.index_em_hist
+            df_raw = ak.index_em_hist(
                 symbol=symbol, 
-                period="daily", 
                 start_date=start_date, 
-                end_date=end_date_str
+                end_date=end_date_str,
+                adjust='qfq' 
             )
             
             # 成功获取，跳出重试循环
@@ -138,10 +134,17 @@ def get_and_analyze_data_slice(symbol, start_date):
                 logger.warning(f"   - {symbol} 未获取到数据。")
                 return None
             
-            # 2-5. 数据清洗、计算指标和合并 
-            df_raw.columns = ['date', 'open', 'close', 'high', 'low', 'volume', 'amount', 'change_abs', 'change_pct', 'turnover_rate']
+            # 2. 【关键修改】：调整列名以匹配 EM 接口返回的格式
+            df_raw.columns = [
+                'date', 'open', 'close', 'high', 'low', 'change_pct', 
+                'change_abs', 'volume', 'amount', 'turnover_rate'
+            ]
+            
+            # 3. 数据清洗、计算指标和合并 
             df_raw['date'] = pd.to_datetime(df_raw['date'])
             df_raw_processed = df_raw[['date', 'open', 'close', 'high', 'low', 'volume', 'turnover_rate']].copy()
+            
+            # ... (后续计算指标、合并逻辑不变)
             df_daily = calculate_full_technical_indicators(df_raw_processed.copy())
             daily_cols = df_daily.columns.drop(['date', 'open', 'close', 'high', 'low', 'volume', 'turnover_rate'])
             df_daily = df_daily.rename(columns={col: f'{col}_D' for col in daily_cols})
