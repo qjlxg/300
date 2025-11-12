@@ -1,4 +1,4 @@
-# stock_analysis_ak_optimized.py - 最终优化版（包含重试和较低并发）
+# stock_analysis_ak_optimized.py - 最终优化版（低并发、高重试）
 
 import akshare as ak
 import pandas as pd
@@ -7,19 +7,20 @@ from datetime import datetime, timedelta
 import os
 import pytz
 from concurrent.futures import ThreadPoolExecutor
-import time # 新增：用于重试延迟
+import time # 用于重试延迟
 
 # --- 常量和配置 ---
 shanghai_tz = pytz.timezone('Asia/Shanghai')
 OUTPUT_DIR = "index_data" 
 DEFAULT_START_DATE = '20000101'
-INDICATOR_LOOKBACK_DAYS = 30
-# 关键修改：降低并发数，避免被数据源中断连接
-MAX_WORKERS = 5 
-# 新增：最大重试次数
-MAX_RETRIES = 3 
+INDICATOR_LOOKBACK_DAYS = 30 
 
-# 定义所有主要 A 股指数列表 (已包含你新增的指数)
+# 关键修改：降低并发数以减轻对数据源的压力
+MAX_WORKERS = 3 
+# 关键修改：最大重试次数增加
+MAX_RETRIES = 5 
+
+# 定义所有主要 A 股指数列表
 INDEX_LIST = {
     '000001': '上证指数', '399001': '深证成指', '399006': '创业板指',
     '000016': '上证50', '000300': '沪深300', '000905': '中证500',
@@ -135,7 +136,7 @@ def get_and_analyze_data_slice(symbol, start_date):
         # 捕获连接中断错误并重试
         except Exception as e:
             if attempt < MAX_RETRIES:
-                # 检查是否为连接中断错误 (RemoteDisconnected 或类似的连接错误)
+                # 检查是否为连接中断错误
                 if 'connection' in str(e).lower() or 'remote disconnected' in str(e).lower():
                     print(f"   - 警告：获取 {symbol} 数据失败 (尝试 {attempt}/{MAX_RETRIES})。错误: 连接中断。")
                     # 延迟重试，增加延迟时间以减轻服务器压力
@@ -150,7 +151,7 @@ def get_and_analyze_data_slice(symbol, start_date):
                 print(f"   - 错误：处理指数 {symbol} 达到最大重试次数。最终错误: {e}")
                 return None
 
-# --- 单个指数处理和保存函数 (核心逻辑保持不变) ---
+# --- 单个指数处理和保存函数 (核心逻辑) ---
 
 def process_single_index(code, name):
     """处理单个指数，实现增量下载、计算和覆盖保存"""
@@ -198,6 +199,7 @@ def process_single_index(code, name):
 
     # 3. 整合新旧数据 (使用 deduplication logic)
     df_combined = pd.concat([df_old, df_new_analyzed])
+    # 移除索引重复的行，保留最新的分析结果 (keep='last')
     results_to_save = df_combined[~df_combined.index.duplicated(keep='last')]
     results_to_save = results_to_save.sort_index()
 
@@ -216,7 +218,7 @@ def main():
     print("---")
     
     # 2. 使用 ThreadPoolExecutor 进行并行处理
-    # 关键修改：使用更安全的 MAX_WORKERS = 5
+    # 关键修改：使用更安全的 MAX_WORKERS = 3
     
     futures = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -225,6 +227,7 @@ def main():
             futures.append(future)
 
     # 3. 收集结果
+    # 仅计算成功的任务
     successful_count = sum(f.result() for f in futures if f.result() is not None)
 
     print("---")
