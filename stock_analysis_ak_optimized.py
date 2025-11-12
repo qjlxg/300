@@ -1,4 +1,4 @@
-# stock_analysis_ak_optimized.py - 尝试切换数据源版（低并发、高重试）
+# stock_analysis_ak_optimized.py - 最终稳定串行版（MAX_WORKERS=1）
 
 import akshare as ak
 import pandas as pd
@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import os
 import pytz
 from concurrent.futures import ThreadPoolExecutor
-import time # 用于重试延迟
+import time 
 
 # --- 常量和配置 ---
 shanghai_tz = pytz.timezone('Asia/Shanghai')
@@ -15,8 +15,8 @@ OUTPUT_DIR = "index_data"
 DEFAULT_START_DATE = '20000101'
 INDICATOR_LOOKBACK_DAYS = 30 
 
-# 保持低并发以减轻对数据源的压力
-MAX_WORKERS = 3 
+# 关键修改：将最大并发数降为 1，确保串行执行，解决连接中断问题
+MAX_WORKERS = 1 
 # 最大重试次数
 MAX_RETRIES = 5 
 
@@ -89,7 +89,7 @@ def aggregate_and_analyze(df_raw_slice, freq, prefix):
          
     return agg_df
 
-# --- 增量数据获取与分析核心函数 (引入重试 + 切换数据源) ---
+# --- 增量数据获取与分析核心函数 (修复 adjust 错误) ---
 
 def get_and_analyze_data_slice(symbol, start_date):
     """
@@ -98,17 +98,16 @@ def get_and_analyze_data_slice(symbol, start_date):
     end_date_str = datetime.now(shanghai_tz).strftime('%Y%m%d')
     print(f"   - 正在获取 {symbol} 从 {start_date} 开始的数据...")
 
-    # 关键：增加重试逻辑
+    # 增加重试逻辑
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             # 1. 获取日线数据切片
-            # 关键修改：增加 adjust='hfq' 参数，尝试切换数据源
             df_raw = ak.index_zh_a_hist(
                 symbol=symbol, 
                 period="daily", 
                 start_date=start_date, 
-                end_date=end_date_str,
-                adjust="hfq"
+                end_date=end_date_str
+                # 【关键修复：已移除错误的 adjust 参数】
             )
             
             # 成功获取，跳出重试循环
@@ -116,7 +115,7 @@ def get_and_analyze_data_slice(symbol, start_date):
                 print(f"   - {symbol} 未获取到数据。")
                 return None
             
-            # 2-5. 数据清洗、计算指标和合并 (成功后执行)
+            # 2-5. 数据清洗、计算指标和合并 
             df_raw.columns = ['date', 'open', 'close', 'high', 'low', 'volume', 'amount', 'change_abs', 'change_pct', 'turnover_rate']
             df_raw['date'] = pd.to_datetime(df_raw['date'])
             df_raw_processed = df_raw[['date', 'open', 'close', 'high', 'low', 'volume', 'turnover_rate']].copy()
@@ -211,16 +210,15 @@ def process_single_index(code, name):
     results_to_save.to_csv(output_path, encoding='utf-8')
     return True
 
-# --- 主执行逻辑 (使用多线程) ---
+# --- 主执行逻辑 (使用串行执行) ---
 def main():
     # 1. 设置输出路径
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     print(f"-> 结果将保存到专用目录: {OUTPUT_DIR}")
-    print(f"-> 准备并行处理 {len(INDEX_LIST)} 个主要指数...")
+    print(f"-> 准备串行处理 {len(INDEX_LIST)} 个主要指数...")
     print("---")
     
-    # 2. 使用 ThreadPoolExecutor 进行并行处理
-    # 关键：使用 MAX_WORKERS = 3
+    # 2. 使用 ThreadPoolExecutor 进行串行处理 (MAX_WORKERS = 1)
     
     futures = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
