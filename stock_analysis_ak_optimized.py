@@ -22,6 +22,8 @@ INDEX_LIST = {
     '000016': '上证50', '000300': '沪深300', '000905': '中证500',
     '000852': '中证1000', '000688': '科创50', '399300': '沪深300(深)',
     '000991': '中证全指',
+    '000906': '中证800', '399005': '中小板指', '399330': '深证100',
+    '000010': '上证180', '000015': '红利指数',
 }
 
 # --- 指标计算函数 ---
@@ -49,6 +51,27 @@ def calculate_full_technical_indicators(df):
     df.ta.macd(append=True)
     df = df.rename(columns={'MACD_12_26_9': 'MACD', 'MACDh_12_26_9': 'MACDh', 'MACDs_12_26_9': 'MACDs'})
 
+    # 5. Bollinger Bands (BBANDS) - length=20, std=2
+    df.ta.bbands(length=20, std=2, append=True)
+    df = df.rename(columns={
+        'BBL_20_2.0': 'BB_lower',
+        'BBM_20_2.0': 'BB_middle',
+        'BBU_20_2.0': 'BB_upper',
+        'BBB_20_2.0': 'BB_bandwidth',
+        'BBP_20_2.0': 'BB_percent'
+    })
+
+    # 6. Average True Range (ATR)
+    df.ta.atr(length=14, append=True)
+    df = df.rename(columns={'ATRr_14': 'ATR14'})
+
+    # 7. Commodity Channel Index (CCI)
+    df.ta.cci(length=20, append=True)
+    df = df.rename(columns={'CCI_20_0.015': 'CCI20'})
+
+    # 8. On-Balance Volume (OBV)
+    df.ta.obv(append=True)
+    
     return df.reset_index()
 
 def aggregate_and_analyze(df_raw_slice, freq, prefix):
