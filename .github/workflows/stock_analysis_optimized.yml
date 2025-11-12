@@ -1,74 +1,70 @@
-# .github/workflows/stock_analysis_optimized.yml
-
 name: 🚀 优化版指数分析 (增量与重叠)
 
-# 触发条件
+# 定义触发器
 on:
-  workflow_dispatch:
+  # 1. 每天定时运行 (北京时间 18:00)
   schedule:
-    - cron: '00 10 * * *' # 每天北京时间 18:00
+    # cron: '0 10 * * *' # UTC时间 10:00，对应北京时间 18:00
+    - cron: '0 10 * * *'
+  # 2. 手动触发
+  workflow_dispatch:
+  # 3. 提交代码到 main 分支时触发
   push:
-    paths:
-      - 'stock_analysis_ak_optimized.py' # 脚本文件名已更新
-      - '.github/workflows/stock_analysis_optimized.yml'
-      
-defaults:
-  run:
-    shell: bash
+    branches:
+      - main
 
 jobs:
   analyze_and_push:
     runs-on: ubuntu-latest
-    env:
-      TZ: Asia/Shanghai
-
+    
     steps:
-      # 1. 检出代码 (必须要有 fetch-depth: 0 才能读取旧数据和推送)
       - name: ⬇️ Checkout Repository
         uses: actions/checkout@v4
         with:
+          # 必须拉取历史记录才能进行 Git 提交
           fetch-depth: 0
 
-      # 2. 设置 Python 环境
-      - name: 🐍 Set up Python
+      # 1. 设置 Python 环境 (修复 numba 兼容性问题)
+      - name: 🐍 Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      # 3. 安装依赖 (akshare, pandas-ta)
-      - name: ⚙️ Install dependencies
+      # 2. 安装依赖
+      - name: 📦 Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install akshare pandas pytz pandas-ta
+          # 安装 akshare, pandas, pandas-ta
+          pip install akshare pandas pandas-ta
 
-      # 4. 运行分析脚本 (脚本内部已实现多线程并行下载和增量更新)
-      - name: 🏃 Run Optimized Analysis
+      # 3. 运行数据分析脚本，并禁用进度条
+      - name: 🏃 Run Data Analysis and Disable TQDM
+        env:
+          # 关键：禁用可能由 akshare 内部依赖产生的进度条
+          TQDM_DISABLE: true
         run: |
+          # 运行您优化后的 Python 脚本
           python stock_analysis_ak_optimized.py
 
-      # 5. 配置 Git
-      - name: ⚙️ Configure Git
+      # 4. 提交和推送更新后的数据文件
+      - name: ⬆️ Commit and Push Data
         run: |
+          # 配置 Git 用户信息
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           
-      # 6. 添加、提交和推送结果
-      - name: 📤 Commit and Push Results
-        run: |
-          if [ -n "$(git status --porcelain)" ]; then
-            echo "--- 发现新的分析结果，正在提交 ---"
-            
-            # 添加 index_data 目录中的所有文件
+          # 检查是否有新的数据文件或更新
+          if git diff --exit-code --quiet index_data; then
+            echo "No data changes to commit. Exiting."
+          else
+            # 添加新的或修改的文件
             git add index_data
             
             # 提交更改
-            COMMIT_MESSAGE="📊 Auto: Optimized index data update for $(date '+%Y-%m-%d %H:%M:%S')"
-            git commit -m "$COMMIT_MESSAGE"
+            timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+            git commit -m "🤖 Data Update: Automated index analysis for ${timestamp} [skip ci]"
             
-            # 推送到仓库
+            # 推送更改到 main 分支
             git push
-            
-            echo "✅ 提交和推送成功。"
-          else
-            echo "--- 文件内容没有变化，跳过推送。---"
+            echo "Data pushed successfully."
           fi
