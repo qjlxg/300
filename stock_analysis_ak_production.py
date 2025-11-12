@@ -1,13 +1,17 @@
-# stock_analysis_ak_production.py - 最终回退原始接口，无重试版
+# stock_analysis_pytdx_production.py - 最终 pytdx (通达信) 稳定版
 
-import akshare as ak
 import pandas as pd
 import pandas_ta as ta
 from datetime import datetime, timedelta
-import os 
 import pytz
 from concurrent.futures import ThreadPoolExecutor
 import time 
+
+# --- 新增 pytdx 依赖 ---
+from pytdx.hq import TdxHq_API
+from pytdx.exhq import TdxExHq_API
+from pytdx.util import best_ip
+from pytdx.errors import TdxConnectionError
 
 # --- 顶部新增导入 ---
 import logging
@@ -15,28 +19,46 @@ from pathlib import Path
 from tqdm import tqdm
 import warnings
 warnings.filterwarnings("ignore")
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # --- 常量和配置 ---
 shanghai_tz = pytz.timezone('Asia/Shanghai')
 OUTPUT_DIR = "index_data" 
-DEFAULT_START_DATE = '20000101'
+DEFAULT_START_DATE = '2000-01-01' # pytdx 接口需要 YYYY-MM-DD 格式
 INDICATOR_LOOKBACK_DAYS = 30 
 LOCK_FILE = "stock_analysis.lock" 
 
-# 关键设置：保持串行
 MAX_WORKERS = 1 
-# 保持无重试
-MAX_RETRIES = 1 
+MAX_RETRIES = 3 # pytdx 连接重试次数，尝试 3 次
 
-# 定义所有主要 A 股指数列表
+# 通达信服务器 IP 和端口
+TDX_SERVERS = [
+    ('119.147.212.81', 7709), 
+    ('119.147.212.81', 7721)  
+]
+# pytdx 周期映射: 9:日线, 5:周线, 6:月线, 8:1分钟
+TDX_FREQ_MAP = {'D': 9, 'W': 5, 'M': 6}
+
+# 定义所有主要 A 股指数列表 (注意：pytdx 需要 SH/SZ 市场代码)
 INDEX_LIST = {
-    '000001': '上证指数', '399001': '深证成指', '399006': '创业板指',
-    '000016': '上证50', '000300': '沪深300', '000905': '中证500',
-    '000852': '中证1000', '000688': '科创50', '399300': '沪深300(深)',
-    '000991': '中证全指',
-    '000906': '中证800', '399005': '中小板指', '399330': '深证100',
-    '000010': '上证180', '000015': '红利指数',
-    '000011': '上证基金指数', '399305': '深证基金指数', '399306': '深证ETF指数',
+    '000001': {'name': '上证指数', 'market': 1}, 
+    '399001': {'name': '深证成指', 'market': 0}, 
+    '399006': {'name': '创业板指', 'market': 0},
+    '000016': {'name': '上证50', 'market': 1}, 
+    '000300': {'name': '沪深300', 'market': 1}, 
+    '000905': {'name': '中证500', 'market': 1},
+    '000852': {'name': '中证1000', 'market': 1}, 
+    '000688': {'name': '科创50', 'market': 1}, 
+    '399300': {'name': '沪深300(深)', 'market': 0},
+    '000991': {'name': '中证全指', 'market': 1},
+    '000906': {'name': '中证800', 'market': 1}, 
+    '399005': {'name': '中小板指', 'market': 0}, 
+    '399330': {'name': '深证100', 'market': 0},
+    '000010': {'name': '上证180', 'market': 1}, 
+    '000015': {'name': '红利指数', 'market': 1},
+    '000011': {'name': '上证基金指数', 'market': 1}, 
+    '399305': {'name': '深证基金指数', 'market': 0}, 
+    '399306': {'name': '深证ETF指数', 'market': 0},
 }
 
 # --- 配置日志系统 (保持不变) ---
@@ -50,14 +72,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# --- 连接客户端 (连接重试) ---
 
-# --- 指标计算函数 & 聚合函数 (保持不变) ---
+def connect_tdx_api(servers):
+    """尝试连接通达信行情 API"""
+    api = TdxHq_API()
+    for ip, port in servers:
+        try:
+            logger.info(f"   - 尝试连接 pytdx 服务器: {ip}:{port}")
+            if api.connect(ip, port):
+                logger.info(f"   - 连接成功: {ip}:{port}")
+                return api
+        except TdxConnectionError:
+            logger.warning(f"   - 连接失败: {ip}:{port}")
+    return None
+
+# --- 指标计算函数 (保持不变) ---
+
 def calculate_full_technical_indicators(df):
-    # ... (函数体不变)
+    """计算完整的技术指标集：MA, RSI, KDJ, MACD, BBANDS, ATR, CCI, OBV"""
     if df.empty:
         return df
     
     df = df.set_index('date')
+    # ... (计算逻辑与之前版本相同)
     df.ta.sma(length=5, append=True, col_names=('MA5',))
     df.ta.sma(length=20, append=True, col_names=('MA20',))
     df.ta.rsi(length=14, append=True, col_names=('RSI14',))
@@ -75,21 +113,27 @@ def calculate_full_technical_indicators(df):
     df.ta.cci(length=20, append=True)
     df = df.rename(columns={'CCI_20_0.015': 'CCI20'})
     df.ta.obv(append=True)
+    
     return df.reset_index()
 
 
 def aggregate_and_analyze(df_raw_slice, freq, prefix):
-    # ... (函数体不变)
+    """按频率聚合数据并计算指标 (pytdx 原始数据没有 turnover_rate)"""
     if df_raw_slice.empty:
         return pd.DataFrame()
         
+    # pytdx 原始数据没有 turnover_rate，用 volume/amount 估算，或直接不聚合该列
+    # 这里为了兼容性，简单将其设置为 NaN，后续指标计算不会依赖它
+    df_raw_slice['turnover_rate'] = float('nan')
+    
+    # 按照 pytdx 数据的日期字段进行重采样
     agg_df = df_raw_slice.resample(freq).agg({
         'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last',
-        'volume': 'sum', 'turnover_rate': 'mean'
-    }).dropna()
+        'vol': 'sum', 'turnover_rate': 'mean'
+    }).dropna(subset=['close'])
     
     if not agg_df.empty:
-         agg_df = agg_df.reset_index().rename(columns={'index': 'date'})
+         agg_df = agg_df.reset_index().rename(columns={'index': 'date', 'vol': 'volume'})
          agg_df = calculate_full_technical_indicators(agg_df)
          
          cols_to_keep = agg_df.columns.drop(['date', 'open', 'close', 'high', 'low', 'volume', 'turnover_rate'])
@@ -99,119 +143,184 @@ def aggregate_and_analyze(df_raw_slice, freq, prefix):
          
     return agg_df
 
-# --- 增量数据获取与分析核心函数 (回退到原始接口) ---
+# --- 增量数据获取与分析核心函数 (使用 pytdx 分页) ---
 
-def get_and_analyze_data_slice(symbol, start_date):
+def get_full_history_data(api, market, code, freq):
     """
-    使用 akshare 的默认接口 (index_zh_a_hist) 获取数据。
+    使用 pytdx 分页获取完整的历史 K 线数据。
+    pytdx 单次最多获取 800 条数据。
     """
-    end_date_str = datetime.now(shanghai_tz).strftime('%Y%m%d')
-    logger.info(f"   - 正在获取 {symbol} (默认接口) 从 {start_date} 开始的数据...")
-
-    # MAX_RETRIES = 1，循环只会执行一次
-    for attempt in range(1, MAX_RETRIES + 1):
+    all_data = []
+    
+    # 从最新的数据开始往前分页获取
+    for start in range(0, 50000, 800): # 限制最多获取 50000 条数据 (约 200 年，安全限制)
         try:
-            # 1. 【关键回退】：使用默认接口 ak.index_zh_a_hist
-            df_raw = ak.index_zh_a_hist(
-                symbol=symbol, 
-                period="daily", 
-                start_date=start_date, 
-                end_date=end_date_str
-            )
+            # pytdx.get_security_bars 每次最多获取 800 条数据
+            data = api.get_security_bars(freq, market, code, start, 800)
             
-            # 成功获取，跳出重试循环
-            if df_raw.empty:
-                logger.warning(f"   - {symbol} 未获取到数据。")
-                return None
+            if not data:
+                break
             
-            # 2. 【关键回退】：调整列名以匹配原始接口返回的格式
-            df_raw.columns = ['date', 'open', 'close', 'high', 'low', 'volume', 'amount', 'change_abs', 'change_pct', 'turnover_rate']
+            df = api.to_df(data)
             
-            # 3. 数据清洗、计算指标和合并 (保持不变)
-            df_raw['date'] = pd.to_datetime(df_raw['date'])
-            df_raw_processed = df_raw[['date', 'open', 'close', 'high', 'low', 'volume', 'turnover_rate']].copy()
+            if df.empty:
+                break
             
-            df_daily = calculate_full_technical_indicators(df_raw_processed.copy())
-            daily_cols = df_daily.columns.drop(['date', 'open', 'close', 'high', 'low', 'volume', 'turnover_rate'])
-            df_daily = df_daily.rename(columns={col: f'{col}_D' for col in daily_cols})
-            df_raw.set_index('date', inplace=True)
-            df_weekly = aggregate_and_analyze(df_raw, 'W', 'W')
-            df_monthly = aggregate_and_analyze(df_raw, 'M', 'M')
-            df_yearly = aggregate_and_analyze(df_raw, 'Y', 'Y')
-            df_daily.set_index('date', inplace=True)
-            results = df_daily.copy()
-            results = results.join(df_weekly, how='left').join(df_monthly, how='left').join(df_yearly, how='left')
-            results.index.name = 'date'
+            # pytdx 返回的数据是倒序的（最新数据在最前面），这里需要倒序排列
+            all_data.append(df)
             
-            logger.info(f"   - {symbol} 成功分析 {len(results)} 行数据切片。")
-            return results.sort_index()
-
-        # 统一异常处理 (无重试)
+            # 如果获取的数据不足 800 条，说明已经获取到最旧的数据，可以停止
+            if len(df) < 800:
+                break
+            
         except Exception as e:
-            # 第一次尝试失败，直接报错并返回 None
-            logger.error(f"   - 错误：处理指数 {symbol} 失败。最终错误: {e}")
+            logger.error(f"   - pytdx 分页获取 {code} 失败 (Start={start})。错误: {e}")
+            break # 出现错误直接退出循环
+            
+    if all_data:
+        # 合并所有分页数据，并去除重复
+        df_combined = pd.concat(all_data, ignore_index=True)
+        # 去除重复行 (偶尔出现)
+        df_combined.drop_duplicates(subset=['datetime'], keep='first', inplace=True)
+        # 按照日期升序排列 (最旧到最新)
+        df_combined.sort_values(by='datetime', inplace=True)
+        
+        # 格式化日期
+        df_combined['date'] = pd.to_datetime(df_combined['datetime']).dt.date
+        df_combined.set_index('date', inplace=True)
+        
+        return df_combined
+    return pd.DataFrame()
+
+
+def get_and_analyze_data_slice(api, market, code, start_date):
+    """
+    获取数据切片 (因为 pytdx 没有按日期范围查询的功能，只能全量获取后本地筛选)。
+    """
+    logger.info(f"   - 正在获取 {code} (pytdx 接口) 全量数据...")
+
+    try:
+        # 1. 全量获取数据
+        df_full = get_full_history_data(api, market, code, TDX_FREQ_MAP['D'])
+
+        if df_full.empty:
+            logger.warning(f"   - {code} 未获取到数据。")
             return None
+        
+        # 2. 本地筛选（获取增量/重叠切片）
+        start_dt = datetime.strptime(start_date, '%Y-%m-%d').date()
+        df_raw = df_full[df_full.index >= start_dt].copy()
 
-# --- 单个指数处理和保存函数 (保持不变) ---
+        if df_raw.empty:
+            logger.warning(f"   - {code} 筛选后切片为空。")
+            return None
+        
+        # 3. pytdx 数据清洗和重命名
+        df_raw.rename(columns={'vol': 'volume'}, inplace=True)
+        
+        # 4. 指标计算
+        df_raw_processed = df_raw[['open', 'close', 'high', 'low', 'volume']].copy()
+        df_raw_processed = df_raw_processed.reset_index()
 
-def process_single_index(code, name):
+        df_daily = calculate_full_technical_indicators(df_raw_processed.copy())
+        
+        # 5. 周/月/年指标聚合计算（需要原始 close/high/low/vol 数据，且 date 设为 index）
+        df_raw.reset_index(inplace=True)
+        df_raw['turnover_rate'] = float('nan') # 占位
+        df_raw.set_index('date', inplace=True)
+        
+        daily_cols = df_daily.columns.drop(['date', 'open', 'close', 'high', 'low', 'volume', 'turnover_rate'])
+        df_daily = df_daily.rename(columns={col: f'{col}_D' for col in daily_cols})
+        df_daily.set_index('date', inplace=True)
+        
+        # 聚合和合并
+        df_weekly = aggregate_and_analyze(df_raw, 'W', 'W')
+        df_monthly = aggregate_and_analyze(df_raw, 'M', 'M')
+        df_yearly = aggregate_and_analyze(df_raw, 'Y', 'Y')
+
+        results = df_daily.copy()
+        results = results.join(df_weekly, how='left').join(df_monthly, how='left').join(df_yearly, how='left')
+        results.index.name = 'date'
+        
+        logger.info(f"   - {code} 成功分析 {len(results)} 行数据切片。")
+        return results.sort_index()
+
+    except Exception as e:
+        logger.error(f"   - 错误：处理指数 {code} 失败。最终错误: {e}")
+        return None
+
+# --- 单个指数处理和保存函数 (适配 pytdx) ---
+
+def process_single_index(api, code_map):
     """处理单个指数，实现增量下载、计算和覆盖保存"""
+    code = code_map['code']
+    name = code_map['name']
+    market = code_map['market']
+    
     logger.info(f"-> 正在处理指数: {code} ({name})")
     
     file_name = f"{code.replace('.', '_')}.csv"
     output_path = Path(OUTPUT_DIR) / file_name
     
+    # pytdx 需要 YYYY-MM-DD 格式
     start_date_to_request = DEFAULT_START_DATE
     df_old = pd.DataFrame()
     
     # 1. 确定本次下载的起始日期 
+    # (pytdx 是全量获取，这里 start_date_to_request 仅用于本地筛选重叠切片)
     if output_path.exists():
         try:
+            # ... (读取旧文件逻辑不变)
             df_old = pd.read_csv(output_path, index_col='date', parse_dates=True)
             if not df_old.empty:
                 latest_date_in_repo = df_old.index.max()
                 
                 # 往前推 INDICATOR_LOOKBACK_DAYS 天
                 start_date_for_calc = latest_date_in_repo - timedelta(days=INDICATOR_LOOKBACK_DAYS)
-                start_date_to_request = start_date_for_calc.strftime('%Y%m%d')
+                start_date_to_request = start_date_for_calc.strftime('%Y-%m-%d')
                 
-                if start_date_for_calc.strftime('%Y%m%d') < DEFAULT_START_DATE:
+                if start_date_for_calc.strftime('%Y-%m-%d') < DEFAULT_START_DATE:
                      start_date_to_request = DEFAULT_START_DATE
                 
-                logger.info(f"   - 检测到旧数据，最新日期为 {latest_date_in_repo.strftime('%Y-%m-%d')}。从 {start_date_to_request} 开始下载增量数据块（含重叠）。")
+                logger.info(f"   - 检测到旧数据，最新日期为 {latest_date_in_repo.strftime('%Y-%m-%d')}。本地筛选从 {start_date_to_request} 开始的切片（含重叠）。")
             else:
-                logger.warning(f"   - 旧文件 {output_path.name} 为空，从 {DEFAULT_START_DATE} 开始下载所有历史数据。")
+                logger.warning(f"   - 旧文件 {output_path.name} 为空，将全量下载。")
         except Exception as e:
-            logger.error(f"   - 警告：读取旧文件 {output_path.name} 失败 ({e})，将从 {DEFAULT_START_DATE} 重新下载。")
+            logger.error(f"   - 警告：读取旧文件 {output_path.name} 失败 ({e})，将全量下载。")
             
     else:
-        logger.info(f"   - 文件不存在，从 {DEFAULT_START_DATE} 开始下载所有历史数据。")
+        logger.info(f"   - 文件不存在，将全量下载。")
 
 
-    # 2. 获取最新数据和指标 
-    df_new_analyzed = get_and_analyze_data_slice(code, start_date_to_request)
+    # 2. 获取最新数据和指标 (pytdx 是全量获取后本地筛选)
+    df_new_analyzed = get_and_analyze_data_slice(api, market, code, start_date_to_request)
     
     if df_new_analyzed is None:
-        # 优化判断：如果今天数据已存在，跳过
         if not df_old.empty and df_old.index.max().date() == datetime.now(shanghai_tz).date():
              logger.info(f"   - {code} 数据已是今天最新，跳过保存。")
         else:
              logger.warning(f"   - {code} 未获取到新数据，保持原文件。")
         return False
 
-    # 3. 整合新旧数据 
-    df_combined = pd.concat([df_old, df_new_analyzed])
-    # 移除索引重复的行，保留最新的分析结果 (keep='last')
+    # 3. 整合新旧数据 (旧数据只需要筛选出比新切片更早的部分)
+    if not df_old.empty:
+        old_data_to_keep = df_old[df_old.index < df_new_analyzed.index.min()]
+    else:
+        old_data_to_keep = pd.DataFrame()
+
+
+    df_combined = pd.concat([old_data_to_keep, df_new_analyzed])
+    # 由于我们手动筛选了，理论上不需要去重，但为安全保留
     results_to_save = df_combined[~df_combined.index.duplicated(keep='last')]
     results_to_save = results_to_save.sort_index()
 
     logger.info(f"   - ✅ {code} 成功更新。总行数: {len(results_to_save)}")
     
-    # 4. 保存到 CSV (覆盖旧文件)
+    # 4. 保存到 CSV 
     results_to_save.to_csv(output_path, encoding='utf-8')
     return True
 
-# --- 主执行逻辑 (保持不变) ---
+# --- 主执行逻辑 ---
 def main():
     start_time = time.time()
     output_path = Path(OUTPUT_DIR)
@@ -221,54 +330,69 @@ def main():
     if lock_file_path.exists():
         logger.warning("检测到锁文件，脚本可能正在运行或上次异常退出。终止本次运行。")
         return
+    lock_file_path.touch() 
     
-    lock_file_path.touch() # 创建锁文件
+    # 2. 连接 pytdx API
+    tdx_api = None
+    for attempt in range(MAX_RETRIES):
+        tdx_api = connect_tdx_api(TDX_SERVERS)
+        if tdx_api:
+            break
+        if attempt < MAX_RETRIES - 1:
+            time.sleep(5)
     
+    if not tdx_api:
+        logger.error("❌ 无法连接到任何 pytdx 服务器，脚本终止。")
+        lock_file_path.unlink(missing_ok=True)
+        return
+        
     try:
-        # 2. 初始化目录和日志
+        # 3. 初始化目录和日志
         output_path.mkdir(exist_ok=True) 
         logger.info("—" * 50)
-        logger.info("🚀 脚本开始运行")
+        logger.info("🚀 脚本开始运行 (使用 pytdx)")
         logger.info(f"结果将保存到专用目录: {output_path.resolve()}")
         logger.info(f"准备串行处理 {len(INDEX_LIST)} 个主要指数...")
 
         successful = 0
         failed = 0
         
-        # 3. 使用 ThreadPoolExecutor 进行串行处理 (MAX_WORKERS = 1)
+        # 4. 转换 INDEX_LIST 格式以方便处理
+        jobs = [{'code': code, **data} for code, data in INDEX_LIST.items()]
+        
+        # 5. 使用 ThreadPoolExecutor 进行串行处理 (MAX_WORKERS = 1)
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            # 提交任务，并构建字典用于 tracking
+            # 提交任务，将 API 客户端作为参数传入
             futures = {
-                executor.submit(process_single_index, code, name): (code, name)
-                for code, name in INDEX_LIST.items()
+                executor.submit(process_single_index, tdx_api, job): job
+                for job in jobs
             }
             
-            # 使用 tqdm 包装 futures 循环，提供进度反馈
+            # 使用 tqdm 包装 futures 循环
             for future in tqdm(futures, desc="处理指数", unit="个", ncols=100, leave=True):
-                code, name = futures[future]
+                job = futures[future]
                 try:
-                    # 获取结果，如果为 True 则成功
                     if future.result():
                         successful += 1
                     else:
-                        # 结果为 False（如未获取到新数据或尝试失败）
                         failed += 1
                 except Exception as e:
-                    logger.error(f"处理 {code} ({name}) 时发生未捕获异常: {e}")
+                    logger.error(f"处理 {job['code']} ({job['name']}) 时发生未捕获异常: {e}")
                     failed += 1
         
         end_time = time.time()
         elapsed_time = end_time - start_time
         
-        # 4. 最终统计和输出
+        # 6. 最终统计和输出
         logger.info("—" * 50)
         logger.info(f"✅ 所有指数数据处理完成。总耗时: {elapsed_time:.2f} 秒")
         logger.info(f"统计：成功更新 {successful} 个文件，失败/跳过 {failed} 个。")
 
     finally:
-        # 5. 移除锁文件 (无论成功失败都执行)
+        # 7. 移除锁文件并断开连接
+        tdx_api.close()
         lock_file_path.unlink(missing_ok=True)
-        logger.info("锁文件已清除。")
+        logger.info("pytdx 连接已关闭，锁文件已清除。")
 
 if __name__ == "__main__":
     main()
