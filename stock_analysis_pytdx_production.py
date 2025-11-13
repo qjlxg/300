@@ -1,4 +1,4 @@
-# stock_analysis_pytdx_production.py - 最终 pytdx (通达信) 稳定版 (动态 IP)
+# stock_analysis_pytdx_production.py - 最终 pytdx (通达信) 稳定版 (动态 IP & 行业指数)
 
 import pandas as pd
 import pandas_ta as ta
@@ -9,9 +9,9 @@ import time
 
 # --- 新增 pytdx 依赖 ---
 from pytdx.hq import TdxHq_API
-# from pytdx.exhq import TdxExHq_API # 未使用，保留原代码注释掉
-from pytdx.util import best_ip # <-- 新增：用于动态获取 IP
+from pytdx.util import best_ip 
 from pytdx.errors import TdxConnectionError
+from pytdx.exhq import TdxExHq_API # 尽管本脚本只用 Hq，但为完整性保留导入
 
 # --- 顶部新增导入 ---
 import logging
@@ -31,11 +31,14 @@ LOCK_FILE = "stock_analysis.lock"
 MAX_WORKERS = 1 
 MAX_RETRIES = 3 # pytdx 连接重试次数，尝试 3 次
 
-# --- 新增：动态 IP 获取函数 ---
+# pytdx 周期映射: 9:日线, 5:周线, 6:月线, 8:1分钟
+TDX_FREQ_MAP = {'D': 9, 'W': 5, 'M': 6}
+
+# --- 动态 IP 获取函数 ---
 
 def get_best_servers(num_servers=5):
-    """动态获取最佳 pytdx 服务器列表（2025 年可用 IP）"""
-    # 备用列表（从 2025 年社区更新中提取的可用 IP，优先级高）
+    """动态获取最佳 pytdx 服务器列表（优先使用 best_ip，然后使用备用列表）"""
+    # 备用列表
     fallback_servers = [
         ('114.80.149.19', 7709),    # 华泰证券
         ('114.80.149.22', 7709),    # 华泰备用
@@ -50,14 +53,13 @@ def get_best_servers(num_servers=5):
     ]
     
     try:
-        # 使用 pytdx 内置 best_ip 自动挑选最佳（延迟最低的）
         best = best_ip.select_best_ip()
         
         if best and best.get('ip'):
             logger.info(f"    - 自动挑选最佳 IP: {best['ip']}:{best['port']}")
-            # 优先用 best_ip，然后使用备用列表
             servers = [(best['ip'], best['port'])]
             count = 1
+            # 从备用列表中添加，并排除已选最佳 IP
             for ip, port in fallback_servers:
                 if ip != best['ip'] and count < num_servers:
                     servers.append((ip, port))
@@ -69,21 +71,9 @@ def get_best_servers(num_servers=5):
             
     except Exception as e:
         logger.error(f"    - 获取最佳 IP 失败: {e}，使用内置备用")
-        # 兜底内置备用列表
-        return [
-            ('114.80.149.19', 7709),
-            ('114.80.149.22', 7709),
-            ('119.147.164.60', 7709),
-            ('180.153.18.17', 7709),
-            ('123.125.108.23', 7709)
-        ][:num_servers]
+        return fallback_servers[:num_servers] # 即使失败，也使用前 N 个备用 IP
 
-# 删除了硬编码的 TDX_SERVERS 常量
-
-# pytdx 周期映射: 9:日线, 5:周线, 6:月线, 8:1分钟
-TDX_FREQ_MAP = {'D': 9, 'W': 5, 'M': 6}
-
-# 定义所有主要 A 股指数列表 (注意：pytdx 需要 SH/SZ 市场代码)
+# 定义所有主要 A 股指数列表
 INDEX_LIST = {
     '000001': {'name': '上证指数', 'market': 1}, 
     '399001': {'name': '深证成指', 'market': 0}, 
@@ -129,7 +119,7 @@ WIND_INDUSTRY_DICT = {'882002':'材料', '882001':'能源','882003':'工业','88
 def get_pytdx_market(code):
     """
     根据指数代码规则判断 pytdx 所需的市场代码。
-    市场代码：1 (上证)，0 (深证)。申万、中信、万得一级指数通常被归类为上证市场 (1)。
+    市场代码：1 (上证)，0 (深证)。
     """
     code = str(code)
     # 上证指数代码：000xxx, 88xxxx, 801xxx, CI005xxx
@@ -144,7 +134,6 @@ def get_pytdx_market(code):
 def merge_industry_indexes(index_list, industry_dict, prefix=""):
     """将行业字典合并到 INDEX_LIST 中，并自动判断 market 代码。"""
     for code, name in industry_dict.items():
-        # pytdx 不需要后缀
         pytdx_code = code.split('.')[0] 
         if pytdx_code not in index_list:
             index_list[pytdx_code] = {
@@ -223,6 +212,9 @@ def aggregate_and_analyze(df_raw_slice, freq, prefix):
     df_raw_slice['turnover_rate'] = float('nan')
     
     # 按照 pytdx 数据的日期字段进行重采样
+    # 注意：需要先将 index 转换为 datetime
+    df_raw_slice.index = pd.to_datetime(df_raw_slice.index)
+    
     agg_df = df_raw_slice.resample(freq).agg({
         'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last',
         'vol': 'sum', 'turnover_rate': 'mean'
@@ -230,6 +222,7 @@ def aggregate_and_analyze(df_raw_slice, freq, prefix):
     
     if not agg_df.empty:
         agg_df = agg_df.reset_index().rename(columns={'index': 'date', 'vol': 'volume'})
+        agg_df['date'] = agg_df['date'].dt.date # 保持 date 为 date 对象
         agg_df = calculate_full_technical_indicators(agg_df)
         
         cols_to_keep = agg_df.columns.drop(['date', 'open', 'close', 'high', 'low', 'volume', 'turnover_rate'])
@@ -244,14 +237,12 @@ def aggregate_and_analyze(df_raw_slice, freq, prefix):
 def get_full_history_data(api, market, code, freq):
     """
     使用 pytdx 分页获取完整的历史 K 线数据。
-    pytdx 单次最多获取 800 条数据。
     """
     all_data = []
     
     # 从最新的数据开始往前分页获取
-    for start in range(0, 50000, 800): # 限制最多获取 50000 条数据 (约 200 年，安全限制)
+    for start in range(0, 50000, 800): 
         try:
-            # pytdx.get_security_bars 每次最多获取 800 条数据
             data = api.get_security_bars(freq, market, code, start, 800)
             
             if not data:
@@ -262,26 +253,21 @@ def get_full_history_data(api, market, code, freq):
             if df.empty:
                 break
             
-            # pytdx 返回的数据是倒序的（最新数据在最前面），这里需要倒序排列
             all_data.append(df)
             
-            # 如果获取的数据不足 800 条，说明已经获取到最旧的数据，可以停止
             if len(df) < 800:
                 break
             
         except Exception as e:
             logger.error(f"    - pytdx 分页获取 {code} 失败 (Start={start})。错误: {e}")
-            break # 出现错误直接退出循环
+            break 
             
     if all_data:
-        # 合并所有分页数据
         df_combined = pd.concat(all_data, ignore_index=True)
-        # 去除重复行
         df_combined.drop_duplicates(subset=['datetime'], keep='first', inplace=True)
-        # 按照日期升序排列 (最旧到最新)
         df_combined.sort_values(by='datetime', inplace=True)
         
-        # 格式化日期
+        # 格式化日期：这里使用 datetime 字段并提取 date 部分
         df_combined['date'] = pd.to_datetime(df_combined['datetime']).dt.date
         df_combined.set_index('date', inplace=True)
         
@@ -323,7 +309,7 @@ def get_and_analyze_data_slice(api, market, code, start_date):
         # 5. 周/月/年指标聚合计算
         df_raw.reset_index(inplace=True)
         df_raw['turnover_rate'] = float('nan') # 占位
-        df_raw.set_index('date', inplace=True)
+        df_raw.set_index('date', inplace=True) # 重设 index 为 date 对象
         
         daily_cols = df_daily.columns.drop(['date', 'open', 'close', 'high', 'low', 'volume', 'turnover_rate'])
         df_daily = df_daily.rename(columns={col: f'{col}_D' for col in daily_cols})
@@ -358,7 +344,6 @@ def process_single_index(api, code_map):
     file_name = f"{code.replace('.', '_')}.csv"
     output_path = Path(OUTPUT_DIR) / file_name
     
-    # pytdx 需要 YYYY-MM-DD 格式
     start_date_to_request = DEFAULT_START_DATE
     df_old = pd.DataFrame()
     
@@ -369,7 +354,6 @@ def process_single_index(api, code_map):
             if not df_old.empty:
                 latest_date_in_repo = df_old.index.max()
                 
-                # 往前推 INDICATOR_LOOKBACK_DAYS 天
                 start_date_for_calc = latest_date_in_repo - timedelta(days=INDICATOR_LOOKBACK_DAYS)
                 start_date_to_request = start_date_for_calc.strftime('%Y-%m-%d')
                 
@@ -386,17 +370,19 @@ def process_single_index(api, code_map):
         logger.info(f"    - 文件不存在，将全量下载。")
 
 
-    # 2. 获取最新数据和指标 (pytdx 是全量获取后本地筛选)
+    # 2. 获取最新数据和指标 
     df_new_analyzed = get_and_analyze_data_slice(api, market, code, start_date_to_request)
     
     if df_new_analyzed is None:
-        if not df_old.empty and df_old.index.max().date() == datetime.now(shanghai_tz).date():
+        # 简单判断是否已经是今天的最新数据（如果获取不到数据，且旧数据是今天，则跳过）
+        today = datetime.now(shanghai_tz).date()
+        if not df_old.empty and df_old.index.max().date() == today:
             logger.info(f"    - {code} 数据已是今天最新，跳过保存。")
         else:
             logger.warning(f"    - {code} 未获取到新数据，保持原文件。")
         return False
 
-    # 3. 整合新旧数据 (旧数据只需要筛选出比新切片更早的部分)
+    # 3. 整合新旧数据 
     if not df_old.empty:
         old_data_to_keep = df_old[df_old.index < df_new_analyzed.index.min()]
     else:
@@ -404,7 +390,6 @@ def process_single_index(api, code_map):
 
 
     df_combined = pd.concat([old_data_to_keep, df_new_analyzed])
-    # 去除重复行
     results_to_save = df_combined[~df_combined.index.duplicated(keep='last')]
     results_to_save = results_to_save.sort_index()
 
@@ -426,7 +411,7 @@ def main():
         return
     lock_file_path.touch() 
     
-    # 2. 连接 pytdx API（修改：动态服务器）
+    # 2. 连接 pytdx API（动态服务器）
     tdx_api = None
     servers = get_best_servers(5)  # 获取 5 个最佳服务器
     logger.info(f"    - 使用服务器列表: {servers}")
@@ -486,9 +471,13 @@ def main():
         logger.info(f"统计：成功更新 {successful} 个文件，失败/跳过 {failed} 个。")
 
     finally:
-        # 7. 移除锁文件并断开连接
-        if tdx_api:
-            tdx_api.close()
+        # 7. 移除锁文件并断开连接 (增强错误处理)
+        if tdx_api: # 确保 tdx_api 实例存在
+            try:
+                tdx_api.close()
+            except Exception as e:
+                logger.warning(f"关闭 pytdx 连接时发生错误: {e}")
+                
         lock_file_path.unlink(missing_ok=True)
         logger.info("pytdx 连接已关闭，锁文件已清除。")
 
