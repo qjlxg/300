@@ -1,4 +1,4 @@
-# stock_analysis_pytdx_production.py - 最终修复版（防炸 + ExHq 自动 + IP 缓存）
+# stock_analysis_pytdx_production.py - 最终完整修复版（生产可用）
 import pandas as pd
 import pandas_ta as ta
 from datetime import datetime, timedelta
@@ -20,7 +20,7 @@ from pytdx.exhq import TdxExHq_API
 from pytdx.errors import TdxConnectionError
 from pandas.api.types import is_datetime64_any_dtype
 
-# --- 常量和配置 ---
+# --- 常量配置 ---
 shanghai_tz = pytz.timezone('Asia/Shanghai')
 OUTPUT_DIR = Path("index_data")
 DEFAULT_START_DATE = '2000-01-01'
@@ -30,7 +30,7 @@ MAX_WORKERS = 3
 MAX_RETRIES = 3
 IP_CACHE = Path("best_ip.json")
 
-# pytdx 周期映射
+# pytdx 频率映射
 TDX_FREQ_MAP = {'D': 9, 'W': 5, 'M': 6}
 
 # --- 指数列表 ---
@@ -55,10 +55,31 @@ INDEX_LIST = {
     '399306': {'name': '深证ETF指数', 'market': 0},
 }
 
-# 行业指数合并（保持不变）
-SW_INDUSTRY_DICT = { ... }  # 保持原样
-CS_INDUSTRY_DICT = { ... }
-WIND_INDUSTRY_DICT = { ... }
+# --- 行业指数字典 ---
+SW_INDUSTRY_DICT = {
+    '801010': '农林牧渔', '801020': '采掘', '801030': '化工', '801040': '钢铁', '801050': '有色金属',
+    '801080': '电子', '801110': '家用电器', '801120': '食品饮料', '801130': '纺织服装', '801140': '轻工制造',
+    '801150': '医药生物', '801160': '公用事业', '801170': '交通运输', '801180': '房地产', '801200': '商业贸易',
+    '801210': '休闲服务', '801230': '综合', '801710': '建筑材料', '801720': '建筑装饰', '801730': '电气设备',
+    '801740': '国防军工', '801750': '计算机', '801760': '传媒', '801770': '通信', '801780': '银行',
+    '801790': '非银金融', '801880': '汽车', '801890': '机械设备', '801060': '建筑建材', '801070': '机械设备',
+    '801090': '交运设备', '801190': '金融服务', '801100': '信息设备', '801220': '信息服务'
+}
+
+CS_INDUSTRY_DICT = {
+    'CI005001': '石油石化', 'CI005002': '煤炭', 'CI005003': '有色金属', 'CI005004': '电力及公用事业',
+    'CI005005': '钢铁', 'CI005006': '基础化工', 'CI005007': '建筑', 'CI005008': '建材', 'CI005009': '轻工制造',
+    'CI005010': '机械', 'CI005011': '电力设备', 'CI005012': '国防军工', 'CI005013': '汽车', 'CI005014': '商贸零售',
+    'CI005015': '餐饮旅游', 'CI005016': '家电', 'CI005017': '纺织服装', 'CI005018': '医药', 'CI005019': '食品饮料',
+    'CI005020': '农林牧渔', 'CI005021': '银行', 'CI005022': '非银行金融', 'CI005023': '房地产', 'CI005024': '交通运输',
+    'CI005025': '电子元器件', 'CI005026': '通信', 'CI005027': '计算机', 'CI005028': '传媒', 'CI005029': '综合'
+}
+
+WIND_INDUSTRY_DICT = {
+    '882002': '材料', '882001': '能源', '882003': '工业', '882004': '可选消费', '882005': '日常消费',
+    '882006': '医疗保健', '882007': '金融', '882008': '信息技术', '882009': '电信服务',
+    '882010': '公用事业', '882011': '房地产'
+}
 
 def get_pytdx_market(code):
     code = str(code)
@@ -82,7 +103,7 @@ INDEX_LIST = merge_industry_indexes(INDEX_LIST, SW_INDUSTRY_DICT, prefix="申万
 INDEX_LIST = merge_industry_indexes(INDEX_LIST, CS_INDUSTRY_DICT, prefix="中信一级_")
 INDEX_LIST = merge_industry_indexes(INDEX_LIST, WIND_INDUSTRY_DICT, prefix="万得一级_")
 
-# --- 日志 ---
+# --- 日志配置 ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
@@ -93,7 +114,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- IP 缓存 + 动态服务器 ---
+# --- IP 缓存 + 服务器列表 ---
 def get_best_servers(num_servers=5):
     primary = ('115.238.56.198', 7709)
     if IP_CACHE.exists():
@@ -113,20 +134,19 @@ def get_best_servers(num_servers=5):
     ]
     backup_servers = [s for s in backup_servers if s != primary]
     servers = [primary] + backup_servers
-    logger.info(f" - 最终服务器列表: {servers[:num_servers]}")
+    logger.info(f" - 服务器列表: {servers[:num_servers]}")
     return servers[:num_servers]
 
-# --- 连接 API（支持 Hq 和 ExHq）---
+# --- 连接 API（自动识别 ExHq）---
 def connect_tdx_api(code, servers):
-    need_exhq = code in ['000688', '000852', '000348', '000928', '399006', '399300']  # 科创/创业板/新指数
+    need_exhq = code in ['000688', '000852', '000348', '000928', '399006', '399300', '399001']
     api_class = TdxExHq_API if need_exhq else TdxHq_API
     api = api_class()
 
     for ip, port in servers:
         try:
-            logger.info(f" - [{'ExHq' if need_exhq else 'Hq'}] 尝试连接 {ip}:{port}")
+            logger.info(f" - [{'ExHq' if need_exhq else 'Hq'}] 连接 {ip}:{port}")
             if api.connect(ip, port, timeout=10):
-                # 成功后写缓存
                 json.dump([ip, port], IP_CACHE.open('w'))
                 logger.info(f" - 连接成功: {ip}:{port}")
                 return api
@@ -134,7 +154,7 @@ def connect_tdx_api(code, servers):
             logger.warning(f" - 连接失败 {ip}:{port}: {e}")
     return None
 
-# --- 数据获取（防炸核心）---
+# --- 获取全量历史数据（防炸核心）---
 def get_full_history_data(api, market, code, freq):
     all_data = []
     for start in range(0, 50000, 800):
@@ -149,7 +169,7 @@ def get_full_history_data(api, market, code, freq):
             if len(df) < 800:
                 break
         except Exception as e:
-            logger.error(f" - 分页失败 {code} (start={start}): {e}")
+            logger.error(f" - {code} 分页失败 (start={start}): {e}")
             break
 
     if not all_data:
@@ -159,7 +179,7 @@ def get_full_history_data(api, market, code, freq):
     df_combined.drop_duplicates(subset=['datetime'], keep='first', inplace=True)
     df_combined.sort_values(by='datetime', inplace=True)
 
-    # --- 关键修复：强制格式 + 双重检查 ---
+    # --- 关键修复：强制格式 + 双重 dtype 检查 ---
     df_combined['valid_datetime'] = pd.to_datetime(
         df_combined['datetime'],
         format='%Y-%m-%d %H:%M:%S',
@@ -183,7 +203,7 @@ def get_full_history_data(api, market, code, freq):
 def calculate_full_technical_indicators(df):
     if df.empty:
         return df
-    df = df.set_index('date') if not df.index.name == 'date' else df
+    df = df.set_index('date') if df.index.name != 'date' else df
     df.ta.sma(length=5, append=True, col_names=('MA5',))
     df.ta.sma(length=20, append=True, col_names=('MA20',))
     df.ta.rsi(length=14, append=True, col_names=('RSI14',))
@@ -200,12 +220,13 @@ def calculate_full_technical_indicators(df):
     df.ta.obv(append=True)
     return df.reset_index()
 
-# --- 聚合 ---
+# --- 聚合分析 ---
 def aggregate_and_analyze(df_raw_slice, freq, prefix):
     if df_raw_slice.empty:
         return pd.DataFrame()
     df_raw_slice.index = pd.to_datetime(df_raw_slice.index, errors='coerce')
     if not is_datetime64_any_dtype(df_raw_slice.index):
+        logger.warning(f" - 聚合 {prefix} 周期失败")
         return pd.DataFrame()
     agg_df = df_raw_slice.resample(freq).agg({
         'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last',
@@ -220,9 +241,9 @@ def aggregate_and_analyze(df_raw_slice, freq, prefix):
     agg_df = agg_df.rename(columns={c: f'{c}_{prefix}' for c in cols})
     return agg_df.set_index('date')
 
-# --- 核心处理 ---
+# --- 获取并分析切片 ---
 def get_and_analyze_data_slice(api, market, code, start_date):
-    logger.info(f" - 获取 {code} 全量数据...")
+    logger.info(f" - 获取 {code} 数据...")
     df_full = get_full_history_data(api, market, code, TDX_FREQ_MAP['D'])
     if df_full.empty:
         return None
@@ -233,8 +254,7 @@ def get_and_analyze_data_slice(api, market, code, start_date):
         return None
 
     df_raw.rename(columns={'vol': 'volume'}, inplace=True)
-    df_raw_processed = df_raw[['open', 'close', 'high', 'low', 'volume']].copy()
-    df_raw_processed = df_raw_processed.reset_index()
+    df_raw_processed = df_raw[['open', 'close', 'high', 'low', 'volume']].copy().reset_index()
     df_daily = calculate_full_technical_indicators(df_raw_processed.copy())
 
     df_raw.reset_index(inplace=True)
@@ -270,10 +290,10 @@ def process_single_index(code_map):
                 latest = df_old.index.max().date()
                 start_calc = latest - timedelta(days=INDICATOR_LOOKBACK_DAYS)
                 start_date_to_request = max(start_calc, datetime.strptime(DEFAULT_START_DATE, '%Y-%m-%d').date()).strftime('%Y-%m-%d')
+                logger.info(f" - 旧数据最新: {latest}，从 {start_date_to_request} 增量")
         except Exception as e:
-            logger.warning(f" - 读取旧文件失败 {e}")
+            logger.warning(f" - 读取旧文件失败: {e}")
 
-    # 每个指数独立连接
     servers = get_best_servers(3)
     api = connect_tdx_api(code, servers)
     if not api:
@@ -289,7 +309,7 @@ def process_single_index(code_map):
         df_combined = pd.concat([df_old, df_new])
         results = df_combined[~df_combined.index.duplicated(keep='last')].sort_index()
         results.to_csv(output_path, encoding='utf-8')
-        logger.info(f" - {code} 更新成功，共 {len(results)} 行")
+        logger.info(f" - {code} 更新成功，{len(results)} 行")
         return True
     except Exception as e:
         logger.error(f" - {code} 处理失败: {e}")
@@ -310,8 +330,8 @@ def main():
     lock_file.touch()
 
     OUTPUT_DIR.mkdir(exist_ok=True)
-    logger.info("—" * 50)
-    logger.info("脚本开始运行")
+    logger.info("—" * 60)
+    logger.info("脚本开始运行 - 指数数据采集与分析")
     logger.info(f"处理 {len(INDEX_LIST)} 个指数")
 
     jobs = [{'code': c, **d} for c, d in INDEX_LIST.items()]
@@ -319,15 +339,15 @@ def main():
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(process_single_index, job) for job in jobs]
-        for future in tqdm(as_completed(futures), total=len(futures), desc="处理指数", unit="个"):
+        for future in tqdm(as_completed(futures), total=len(futures), desc="处理指数", unit="个", ncols=100):
             if future.result():
                 successful += 1
             else:
                 failed += 1
-            time.sleep(0.2)  # 防封
+            time.sleep(0.2)
 
     elapsed = time.time() - start_time
-    logger.info("—" * 50)
+    logger.info("—" * 60)
     logger.info(f"完成！耗时: {elapsed:.2f}s，成功: {successful}，失败: {failed}")
     lock_file.unlink(missing_ok=True)
 
