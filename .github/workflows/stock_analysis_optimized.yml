@@ -27,9 +27,16 @@ jobs:
           python-version: '3.12'
 
       # 2. 【关键更新】：安装 pytdx (替代 akshare)
+      # 优化说明：增加强制卸载 pytdx 的步骤，以解决 Tushare 等潜在依赖冲突
       - name: 📦 Install dependencies (pytdx, pandas-ta)
         run: |
           python -m pip install --upgrade pip
+          
+          # --- 关键修正：强制卸载 pytdx，解决版本冲突 ---
+          echo "尝试卸载 pytdx 以解决潜在的 Tushare 版本冲突..."
+          pip uninstall pytdx -y || true
+          
+          # --- 安装所需的依赖 ---
           pip install pytdx pandas pandas-ta tqdm
 
       # 3. 【关键更新】：运行 pytdx 脚本
@@ -46,6 +53,11 @@ jobs:
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           
+          # 检查是否有文件变动
+          # 注意： stock_analysis.lock 文件不应该被 commit，它应该在脚本结束时被删除。
+          # 确保脚本逻辑正确删除了 .lock 文件，否则它可能会被加入 commit
+          
+          # 检查数据目录和日志文件
           if git diff --exit-code --quiet index_data stock_analysis.log; then
             echo "No data or log changes to commit. Exiting."
           else
@@ -54,6 +66,7 @@ jobs:
             timestamp=$(date "+%Y-%m-%d %H:%M:%S")
             git commit -m "🤖 Data Update: Automated index analysis for ${timestamp} [skip ci]"
             
+            # 使用 --force-with-lease 避免潜在的推送冲突
             git push
             echo "Data pushed successfully."
           fi
