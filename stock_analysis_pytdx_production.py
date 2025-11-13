@@ -21,9 +21,11 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 
 
 # --- AkShare 全局配置 (V9 核心改进 1: 设置全局超时) ---
+# 强制设置全局请求超时时间为 30 秒
 try:
     ak.set_time_out(30)
 except Exception as e:
+    # 兼容性处理
     print(f"警告：设置 AkShare 全局超时失败：{e}")
 
 
@@ -35,11 +37,11 @@ INDICATOR_LOOKBACK_DAYS = 30
 LOCK_FILE = "stock_analysis.lock"
 
 MAX_WORKERS = 1 # 保持为1，确保串行
-MAX_RETRIES = 0 # 最大的重试次数
+MAX_RETRIES = 5 # 最大的重试次数
 BASE_DELAY = 10 # 基础延迟提高到 10 秒
 
 # --- 指数列表及代码结构 (保持不变) ---
-# 注意：这些代码大多是指数代码
+
 INDEX_LIST = {
     '000001': {'name': '上证指数', 'market': 1},
     '399001': {'name': '深证成指', 'market': 0},
@@ -50,10 +52,18 @@ INDEX_LIST = {
     '000852': {'name': '中证1000', 'market': 1},
     '000688': {'name': '科创50', 'market': 1},
     '399300': {'name': '沪深300(深)', 'market': 0},
-    # ... (其他指数和行业指数列表保持不变，为节省空间省略) ...
+    '000991': {'name': '中证全指', 'market': 1},
+    '000906': {'name': '中证800', 'market': 1},
+    '399005': {'name': '中小板指', 'market': 0},
+    '399330': {'name': '深证100', 'market': 0},
+    '000010': {'name': '上证180', 'market': 1},
+    '000015': {'name': '红利指数', 'market': 1},
+    '000011': {'name': '上证基金指数', 'market': 1},
+    '399305': {'name': '深证基金指数', 'market': 0},
+    '399306': {'name': '深证ETF指数', 'market': 0},
 }
 
-# 申万行业指数 (为简化和稳定，这里仍使用原脚本的列表)
+# 申万行业指数 (中信/万得暂时禁用，AkShare申万接口相对稳定，但仍需谨慎)
 SW_INDUSTRY_DICT = {'801010':'农林牧渔','801020':'采掘','801030':'化工','801040':'钢铁','801050':'有色金属','801080':'电子','801110':'家用电器','801120':'食品饮料','801130':'纺织服装','801140':'轻工制造','801150':'医药生物','801160':'公用事业','801170':'交通运输','801180':'房地产','801200':'商业贸易','801210':'休闲服务','801230':'综合','801710':'建筑材料','801720':'建筑装饰','801730':'电气设备','801740':'国防军工','801750':'计算机','801760':'传媒','801770':'通信','801780':'银行','801790':'非银金融','801880':'汽车','801890':'机械设备','801060':'建筑建材','801070':'机械设备','801090':'交运设备','801190':'金融服务','801100':'信息设备','801220':'信息服务'}
 CS_INDUSTRY_DICT = {}
 WIND_INDUSTRY_DICT = {}
@@ -93,7 +103,6 @@ logger = logging.getLogger(__name__)
 
 
 # --- 指标计算函数 (保持不变) ---
-# ... (calculate_full_technical_indicators 和 aggregate_and_analyze 函数保持不变) ...
 
 def calculate_full_technical_indicators(df):
     """计算完整的技术指标集：MA, RSI, KDJ, MACD, BBANDS, ATR, CCI, OBV"""
@@ -107,7 +116,6 @@ def calculate_full_technical_indicators(df):
     for col in price_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce')
     
-    # 指标计算逻辑...
     df.ta.sma(length=5, append=True, col_names=('MA5',))
     df.ta.sma(length=20, append=True, col_names=('MA20',))
     df.ta.rsi(length=14, append=True, col_names=('RSI14',))
@@ -154,7 +162,7 @@ def aggregate_and_analyze(df_raw_slice, freq, prefix):
 
 # --- 增量数据获取与分析核心函数 (使用 AkShare V9 - 强化重试/延迟) ---
 
-# 【核心修改部分：使用 ak.stock_zh_a_hist 接口】
+# 【核心修改：使用 ak.stock_zh_a_hist 接口】
 def get_full_history_data(code, start_date_str):
     """
     使用 ak.stock_zh_a_hist 接口获取完整的历史 K 线数据，并加入重试和延迟机制。
@@ -163,7 +171,6 @@ def get_full_history_data(code, start_date_str):
     
     for attempt in range(MAX_RETRIES):
         try:
-            # 申万行业指数 (801开头) 接口复杂，继续跳过
             if code.startswith('801'):
                 logger.warning(f"    - 警告：行业指数 {code} 接口复杂或不稳定，跳过。")
                 return pd.DataFrame()
@@ -174,7 +181,7 @@ def get_full_history_data(code, start_date_str):
                     period="daily", 
                     start_date=start_date_str.replace('-', ''), # AkShare要求无连字符的日期
                     end_date=datetime.now().strftime('%Y%m%d'),
-                    adjust="qfq" # 沿用第二个脚本的复权参数（对指数可能无影响，但保持一致）
+                    adjust="qfq" # 沿用第二个脚本的复权参数
                 )
 
             if df.empty:
@@ -192,13 +199,7 @@ def get_full_history_data(code, start_date_str):
             
             # 检查是否有必须的列，并进行筛选
             required_cols = ['date', 'open', 'close', 'high', 'low', 'volume']
-            if not all(col in df.columns for col in required_cols):
-                 # 兼容旧 index_zh_a_hist 接口可能返回的列
-                 df.rename(columns={'成交额': 'turnover'}, inplace=True)
-                 required_cols.append('turnover') # 如果有成交额，则保留
-                 df = df[[c for c in required_cols if c in df.columns]].copy()
-            else:
-                 df = df[required_cols].copy()
+            df = df[[c for c in required_cols if c in df.columns]].copy()
 
 
             df['date'] = pd.to_datetime(df['date'])
@@ -227,9 +228,6 @@ def get_full_history_data(code, start_date_str):
                 logger.error(f"    - AkShare 获取 {code} 最终失败，放弃。")
                 return pd.DataFrame()
 
-
-# --- 增量数据处理和主函数 (保持不变) ---
-# ... (get_and_analyze_data_slice, process_single_index, main 函数保持不变) ...
 
 def get_and_analyze_data_slice(code, start_date):
     """获取数据切片，包括全量获取、本地筛选和指标计算。"""
