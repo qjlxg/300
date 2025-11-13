@@ -1,4 +1,4 @@
-# stock_analysis_akshare_production_MODIFIED.py - V9 终极稳定版 (使用 stock_zh_a_hist 接口)
+# stock_analysis_akshare_production_V10_FIXED.py - V10 修复版 (使用 ak.index_zh_a_hist 接口获取指数)
 
 import pandas as pd
 import pandas_ta as ta
@@ -160,14 +160,13 @@ def aggregate_and_analyze(df_raw_slice, freq, prefix):
         
     return agg_df
 
-# --- 增量数据获取与分析核心函数 (使用 AkShare V9 - 强化重试/延迟) ---
+# --- 增量数据获取与分析核心函数 (修复为指数接口) ---
 
-# 【核心修改：使用 ak.stock_zh_a_hist 接口】
 def get_full_history_data(code, start_date_str):
     """
-    使用 ak.stock_zh_a_hist 接口获取完整的历史 K 线数据，并加入重试和延迟机制。
+    使用 ak.index_zh_a_hist 接口获取完整的历史 K 线数据，并加入重试和延迟机制。
     """
-    logger.info(f"    - 正在通过 AkShare (stock_zh_a_hist) 获取 {code} (从 {start_date_str} 开始)...")
+    logger.info(f"    - 正在通过 AkShare (index_zh_a_hist) 获取 {code} (从 {start_date_str} 开始)...")
     
     for attempt in range(MAX_RETRIES):
         try:
@@ -175,19 +174,24 @@ def get_full_history_data(code, start_date_str):
                 logger.warning(f"    - 警告：行业指数 {code} 接口复杂或不稳定，跳过。")
                 return pd.DataFrame()
             else:
-                # 使用第二个脚本的核心接口：ak.stock_zh_a_hist
-                df = ak.stock_zh_a_hist(
+                # ====== 核心修复点：使用正确的指数接口 ak.index_zh_a_hist ======
+                df = ak.index_zh_a_hist(
                     symbol=code, 
                     period="daily", 
                     start_date=start_date_str.replace('-', ''), # AkShare要求无连字符的日期
-                    end_date=datetime.now().strftime('%Y%m%d'),
-                    adjust="qfq" # 沿用第二个脚本的复权参数
+                    end_date=datetime.now().strftime('%Y%m%d')
+                    # 注意：指数接口通常不支持复权参数
                 )
 
+            # ====== 修复点 1: 检查 df 是否为 None (防止 'NoneType' object has no attribute 'empty') ======
+            if df is None:
+                 raise ValueError("AkShare returned None, which indicates data is unavailable or the symbol is invalid.")
+            
             if df.empty:
                 raise ValueError("AkShare returned an empty DataFrame.")
             
-            # 字段清洗与重命名 (匹配 stock_zh_a_hist 接口返回的中文列名)
+            # 字段清洗与重命名 (匹配 index_zh_a_hist 接口返回的中文列名)
+            # index_zh_a_hist 返回的列名与 stock_zh_a_hist 相似，但没有成交额和换手率等。
             df.rename(columns={
                 '日期': 'date', 
                 '开盘': 'open', 
@@ -226,15 +230,17 @@ def get_full_history_data(code, start_date_str):
                 time.sleep(wait_time)
             else:
                 logger.error(f"    - AkShare 获取 {code} 最终失败，放弃。")
-                return pd.DataFrame()
+                return pd.DataFrame() # 确保最终返回空 DataFrame，避免 NoneType 错误
 
 
 def get_and_analyze_data_slice(code, start_date):
     """获取数据切片，包括全量获取、本地筛选和指标计算。"""
     
     try:
+        # get_full_history_data 现在已修复为使用指数接口
         df_full = get_full_history_data(code, start_date)
 
+        # 修复后的函数保证返回 DataFrame，所以这里不会触发 NoneType 错误
         if df_full.empty:
             logger.warning(f"    - {code} 未获取到有效数据。")
             return None
@@ -267,7 +273,7 @@ def get_and_analyze_data_slice(code, start_date):
         logger.error(f"    - 错误：处理指数 {code} 失败。最终错误: {e}")
         return None
 
-# --- 单个指数处理和保存函数 ---
+# --- 单个指数处理和保存函数 (保持不变) ---
 
 def process_single_index(code_map):
     """处理单个指数，实现增量下载、计算和覆盖保存"""
@@ -323,7 +329,7 @@ def process_single_index(code_map):
     # 3. 整合新旧数据
     if not df_old.empty:
         df_old.index = df_old.index.date
-        old_data_to_keep = df_old[df_old.index < df_new_analyzed.index.min()]
+        old_data_to_keep = df_old[df_old.index < df_new_analyzed.index.min().date()] # 修正日期比较
     else:
         old_data_to_keep = pd.DataFrame()
         
@@ -341,7 +347,7 @@ def process_single_index(code_map):
     results_to_save.to_csv(output_path, encoding='utf-8')
     return True
 
-# --- 主执行逻辑 ---
+# --- 主执行逻辑 (保持不变) ---
 def main():
     start_time = time.time()
     output_path = Path(OUTPUT_DIR)
@@ -353,7 +359,7 @@ def main():
     lock_file_path.touch()
     
     logger.info("—" * 50)
-    logger.info("🚀 脚本开始运行 (使用 AkShare V9 - MODIFIED, ak.stock_zh_a_hist 接口)")
+    logger.info("🚀 脚本开始运行 (使用 AkShare V10 - FIXED, ak.index_zh_a_hist 接口)")
     
     try:
         output_path.mkdir(exist_ok=True)
