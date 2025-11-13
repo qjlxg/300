@@ -1,4 +1,4 @@
-# stock_analysis_pytdx_production.py - 最终 pytdx (通达信) 稳定版 (移除 best_ip 依赖)
+# stock_analysis_pytdx_production.py - 最终 pytdx (通达信) 稳定版 (日期容错处理)
 
 import pandas as pd
 import pandas_ta as ta
@@ -7,9 +7,8 @@ import pytz
 from concurrent.futures import ThreadPoolExecutor
 import time 
 
-# --- 新增 pytdx 依赖 ---
+# --- pytdx 依赖 ---
 from pytdx.hq import TdxHq_API
-# from pytdx.util import best_ip  # <-- 已移除，不再使用
 from pytdx.errors import TdxConnectionError
 from pytdx.exhq import TdxExHq_API 
 
@@ -24,22 +23,21 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 # --- 常量和配置 ---
 shanghai_tz = pytz.timezone('Asia/Shanghai')
 OUTPUT_DIR = "index_data" 
-DEFAULT_START_DATE = '2000-01-01' # pytdx 接口需要 YYYY-MM-DD 格式
+DEFAULT_START_DATE = '2000-01-01' 
 INDICATOR_LOOKBACK_DAYS = 30 
 LOCK_FILE = "stock_analysis.lock" 
 
 MAX_WORKERS = 1 
-MAX_RETRIES = 3 # pytdx 连接重试次数，尝试 3 次
+MAX_RETRIES = 3 
 
 # pytdx 周期映射: 9:日线, 5:周线, 6:月线, 8:1分钟
 TDX_FREQ_MAP = {'D': 9, 'W': 5, 'M': 6}
 
-# --- 动态 IP 获取函数 (已修正，仅使用稳定列表) ---
+# --- 动态 IP 获取函数 (稳定版) ---
 
 def get_best_servers(num_servers=5):
     """直接返回稳定的 pytdx 服务器备用列表，避免 best_ip 带来的不稳定性。"""
     
-    # 社区推荐的稳定备用列表（优先级高）
     stable_servers = [
         ('114.80.149.19', 7709),    # 华泰证券
         ('114.80.149.22', 7709),    # 华泰备用
@@ -49,7 +47,7 @@ def get_best_servers(num_servers=5):
         ('119.147.164.60', 7709),  # 广发证券
         ('123.125.108.23', 7709),  # 中金公司
         ('180.153.18.17', 7709),    # 招商证券
-        ('121.36.81.195', 7709),    # 社区推荐（2025 更新）
+        ('121.36.81.195', 7709),    # 社区推荐
         ('124.71.187.122', 7709),  # 备用
         ('119.147.212.81', 7721),  # 通用备用端口
         ('119.147.212.81', 7709),  # 通用主用端口
@@ -58,7 +56,8 @@ def get_best_servers(num_servers=5):
     logger.info("    - 绕过 pytdx best_ip 自动选择功能，使用硬编码的稳定 IP 列表。")
     return stable_servers[:num_servers]
 
-# 定义所有主要 A 股指数列表
+# --- 指数列表及市场判断逻辑 (保持不变) ---
+
 INDEX_LIST = {
     '000001': {'name': '上证指数', 'market': 1}, 
     '399001': {'name': '深证成指', 'market': 0}, 
@@ -79,42 +78,20 @@ INDEX_LIST = {
     '399305': {'name': '深证基金指数', 'market': 0}, 
     '399306': {'name': '深证ETF指数', 'market': 0},
 }
-
-# --- 行业指数代码和市场判断逻辑 (保持不变) ---
-
-SW_INDUSTRY_DICT = {'801010':'农林牧渔','801020':'采掘','801030':'化工','801040':'钢铁','801050':'有色金属',
-                    '801080':'电子','801110':'家用电器','801120':'食品饮料','801130':'纺织服装','801140':'轻工制造',
-                    '801150':'医药生物','801160':'公用事业','801170':'交通运输','801180':'房地产','801200':'商业贸易',
-                    '801210':'休闲服务','801230':'综合','801710':'建筑材料','801720':'建筑装饰','801730':'电气设备',
-                    '801740':'国防军工','801750':'计算机','801760':'传媒','801770':'通信','801780':'银行','801790':'非银金融',
-                    '801880':'汽车','801890':'机械设备','801060':'建筑建材','801070':'机械设备','801090':'交运设备',
-                    '801190':'金融服务','801100':'信息设备','801220':'信息服务'}
-
-CS_INDUSTRY_DICT = {'CI005001':'石油石化','CI005002':'煤炭','CI005003':'有色金属','CI005004':'电力及公用事业','CI005005':'钢铁',
-                    'CI005006':'基础化工','CI005007':'建筑','CI005008':'建材','CI005009':'轻工制造','CI005010':'机械',
-                    'CI005011':'电力设备','CI005012':'国防军工','CI005013':'汽车','CI005014':'商贸零售','CI005015':'餐饮旅游',
-                    'CI005016':'家电','CI005017':'纺织服装','CI005018':'医药','CI005019':'食品饮料','CI005020':'农林牧渔',
-                    'CI005021':'银行','CI005022':'非银行金融','CI005023':'房地产','CI005024':'交通运输','CI005025':'电子元器件',
-                    'CI005026':'通信','CI005027':'计算机','CI005028':'传媒','CI005029':'综合'}
-
-WIND_INDUSTRY_DICT = {'882002':'材料', '882001':'能源','882003':'工业','882004':'可选消费','882005':'日常消费',
-                      '882006':'医疗保健', '882007':'金融', '882008':'信息技术', '882009':'电信服务',
-                      '882010':'公用事业', '882011':'房地产'}
+# 申万、中信、万得行业指数字典...
+SW_INDUSTRY_DICT = {'801010':'农林牧渔','801020':'采掘','801030':'化工','801040':'钢铁','801050':'有色金属','801080':'电子','801110':'家用电器','801120':'食品饮料','801130':'纺织服装','801140':'轻工制造','801150':'医药生物','801160':'公用事业','801170':'交通运输','801180':'房地产','801200':'商业贸易','801210':'休闲服务','801230':'综合','801710':'建筑材料','801720':'建筑装饰','801730':'电气设备','801740':'国防军工','801750':'计算机','801760':'传媒','801770':'通信','801780':'银行','801790':'非银金融','801880':'汽车','801890':'机械设备','801060':'建筑建材','801070':'机械设备','801090':'交运设备','801190':'金融服务','801100':'信息设备','801220':'信息服务'}
+CS_INDUSTRY_DICT = {'CI005001':'石油石化','CI005002':'煤炭','CI005003':'有色金属','CI005004':'电力及公用事业','CI005005':'钢铁','CI005006':'基础化工','CI005007':'建筑','CI005008':'建材','CI005009':'轻工制造','CI005010':'机械','CI005011':'电力设备','CI005012':'国防军工','CI005013':'汽车','CI005014':'商贸零售','CI005015':'餐饮旅游','CI005016':'家电','CI005017':'纺织服装','CI005018':'医药','CI005019':'食品饮料','CI005020':'农林牧渔','CI005021':'银行','CI005022':'非银行金融','CI005023':'房地产','CI005024':'交通运输','CI005025':'电子元器件','CI005026':'通信','CI005027':'计算机','CI005028':'传媒','CI005029':'综合'}
+WIND_INDUSTRY_DICT = {'882002':'材料', '882001':'能源','882003':'工业','882004':'可选消费','882005':'日常消费','882006':'医疗保健', '882007':'金融', '882008':'信息技术', '882009':'电信服务','882010':'公用事业', '882011':'房地产'}
 
 def get_pytdx_market(code):
-    """根据指数代码规则判断 pytdx 所需的市场代码。"""
     code = str(code)
-    # 上证指数代码：000xxx, 88xxxx, 801xxx, CI005xxx
     if code.startswith('00') or code.startswith('88') or code.startswith('801') or code.startswith('CI005'):
-        return 1  # 视为上证/通用的指数市场
-    # 深证指数代码：399xxx 
+        return 1  # 上证/通用
     elif code.startswith('399'):
-        return 0
-    # 其他默认视为上证
+        return 0 # 深证
     return 1 
 
 def merge_industry_indexes(index_list, industry_dict, prefix=""):
-    """将行业字典合并到 INDEX_LIST 中，并自动判断 market 代码。"""
     for code, name in industry_dict.items():
         pytdx_code = code.split('.')[0] 
         if pytdx_code not in index_list:
@@ -124,7 +101,6 @@ def merge_industry_indexes(index_list, industry_dict, prefix=""):
             }
     return index_list
 
-# 合并所有行业指数到 INDEX_LIST
 INDEX_LIST = merge_industry_indexes(INDEX_LIST, SW_INDUSTRY_DICT, prefix="申万一级_")
 INDEX_LIST = merge_industry_indexes(INDEX_LIST, CS_INDUSTRY_DICT, prefix="中信一级_")
 INDEX_LIST = merge_industry_indexes(INDEX_LIST, WIND_INDUSTRY_DICT, prefix="万得一级_")
@@ -166,7 +142,6 @@ def calculate_full_technical_indicators(df):
         return df
     
     df = df.set_index('date')
-    # 使用 pandas_ta 计算指标
     df.ta.sma(length=5, append=True, col_names=('MA5',))
     df.ta.sma(length=20, append=True, col_names=('MA20',))
     df.ta.rsi(length=14, append=True, col_names=('RSI14',))
@@ -175,10 +150,7 @@ def calculate_full_technical_indicators(df):
     df.ta.macd(append=True)
     df = df.rename(columns={'MACD_12_26_9': 'MACD', 'MACDh_12_26_9': 'MACDh', 'MACDs_12_26_9': 'MACDs'})
     df.ta.bbands(length=20, std=2, append=True)
-    df = df.rename(columns={
-        'BBL_20_2.0': 'BB_lower', 'BBM_20_2.0': 'BB_middle', 'BBU_20_2.0': 'BB_upper',
-        'BBB_20_2.0': 'BB_bandwidth', 'BBP_20_2.0': 'BB_percent'
-    })
+    df = df.rename(columns={'BBL_20_2.0': 'BB_lower', 'BBM_20_2.0': 'BB_middle', 'BBU_20_2.0': 'BB_upper', 'BBB_20_2.0': 'BB_bandwidth', 'BBP_20_2.0': 'BB_percent'})
     df.ta.atr(length=14, append=True)
     df = df.rename(columns={'ATRr_14': 'ATR14'})
     df.ta.cci(length=20, append=True)
@@ -193,9 +165,8 @@ def aggregate_and_analyze(df_raw_slice, freq, prefix):
     if df_raw_slice.empty:
         return pd.DataFrame()
         
-    df_raw_slice['turnover_rate'] = float('nan') # 占位
+    df_raw_slice['turnover_rate'] = float('nan') 
     
-    # 将 index 转换为 datetime 用于 resample
     df_raw_slice.index = pd.to_datetime(df_raw_slice.index)
     
     agg_df = df_raw_slice.resample(freq).agg({
@@ -205,7 +176,7 @@ def aggregate_and_analyze(df_raw_slice, freq, prefix):
     
     if not agg_df.empty:
         agg_df = agg_df.reset_index().rename(columns={'index': 'date', 'vol': 'volume'})
-        agg_df['date'] = agg_df['date'].dt.date # 保持 date 为 date 对象
+        agg_df['date'] = agg_df['date'].dt.date 
         agg_df = calculate_full_technical_indicators(agg_df)
         
         cols_to_keep = agg_df.columns.drop(['date', 'open', 'close', 'high', 'low', 'volume', 'turnover_rate'])
@@ -215,13 +186,15 @@ def aggregate_and_analyze(df_raw_slice, freq, prefix):
         
     return agg_df
 
-# --- 增量数据获取与分析核心函数 (使用 pytdx 分页) ---
+# --- 增量数据获取与分析核心函数 (已修正日期容错) ---
 
 def get_full_history_data(api, market, code, freq):
-    """使用 pytdx 分页获取完整的历史 K 线数据。"""
+    """
+    使用 pytdx 分页获取完整的历史 K 线数据，并增加日期解析容错。
+    """
     all_data = []
     
-    # 从最新的数据开始往前分页获取 (安全限制 50000 条)
+    # 从最新的数据开始往前分页获取 
     for start in range(0, 50000, 800): 
         try:
             data = api.get_security_bars(freq, market, code, start, 800)
@@ -248,7 +221,20 @@ def get_full_history_data(api, market, code, freq):
         df_combined.drop_duplicates(subset=['datetime'], keep='first', inplace=True)
         df_combined.sort_values(by='datetime', inplace=True)
         
-        df_combined['date'] = pd.to_datetime(df_combined['datetime']).dt.date
+        # --- 关键修正：日期解析容错 ---
+        
+        # 1. 容错解析 datetime 字段：使用 errors='coerce' 将无效日期转换为 NaT
+        df_combined['valid_datetime'] = pd.to_datetime(df_combined['datetime'], errors='coerce')
+        
+        # 2. 移除包含无效日期的行，避免 'month must be in 1..12' 错误
+        df_combined.dropna(subset=['valid_datetime'], inplace=True)
+        
+        if df_combined.empty:
+             logger.warning(f"    - {code} 移除无效日期后数据为空。")
+             return pd.DataFrame()
+
+        # 3. 提取有效的日期部分
+        df_combined['date'] = df_combined['valid_datetime'].dt.date
         df_combined.set_index('date', inplace=True)
         
         return df_combined
@@ -260,7 +246,7 @@ def get_and_analyze_data_slice(api, market, code, start_date):
     logger.info(f"    - 正在获取 {code} (pytdx 接口) 全量数据...")
 
     try:
-        # 1. 全量获取数据
+        # 1. 全量获取数据 (已包含日期容错)
         df_full = get_full_history_data(api, market, code, TDX_FREQ_MAP['D'])
 
         if df_full.empty:
@@ -309,7 +295,7 @@ def get_and_analyze_data_slice(api, market, code, start_date):
         logger.error(f"    - 错误：处理指数 {code} 失败。最终错误: {e}")
         return None
 
-# --- 单个指数处理和保存函数 (适配 pytdx) ---
+# --- 单个指数处理和保存函数 (保持不变) ---
 
 def process_single_index(api, code_map):
     """处理单个指数，实现增量下载、计算和覆盖保存"""
@@ -332,7 +318,6 @@ def process_single_index(api, code_map):
             if not df_old.empty:
                 latest_date_in_repo = df_old.index.max()
                 
-                # 往前推 INDICATOR_LOOKBACK_DAYS 天，确保有足够数据计算指标
                 start_date_for_calc = latest_date_in_repo - timedelta(days=INDICATOR_LOOKBACK_DAYS)
                 start_date_to_request = start_date_for_calc.strftime('%Y-%m-%d')
                 
@@ -377,7 +362,7 @@ def process_single_index(api, code_map):
     results_to_save.to_csv(output_path, encoding='utf-8')
     return True
 
-# --- 主执行逻辑 ---
+# --- 主执行逻辑 (保持不变) ---
 def main():
     start_time = time.time()
     output_path = Path(OUTPUT_DIR)
@@ -450,7 +435,7 @@ def main():
 
     finally:
         # 7. 移除锁文件并断开连接 (增强错误处理)
-        if tdx_api: # 确保 tdx_api 实例存在
+        if tdx_api: 
             try:
                 tdx_api.close()
             except Exception as e:
