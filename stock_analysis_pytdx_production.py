@@ -1,4 +1,4 @@
-# stock_analysis_pytdx_production.py - 最终 pytdx (通达信) 稳定版 (动态 IP & 行业指数)
+# stock_analysis_pytdx_production.py - 最终 pytdx (通达信) 稳定版 (移除 best_ip 依赖)
 
 import pandas as pd
 import pandas_ta as ta
@@ -9,9 +9,9 @@ import time
 
 # --- 新增 pytdx 依赖 ---
 from pytdx.hq import TdxHq_API
-from pytdx.util import best_ip 
+# from pytdx.util import best_ip  # <-- 已移除，不再使用
 from pytdx.errors import TdxConnectionError
-from pytdx.exhq import TdxExHq_API # 尽管本脚本只用 Hq，但为完整性保留导入
+from pytdx.exhq import TdxExHq_API 
 
 # --- 顶部新增导入 ---
 import logging
@@ -34,12 +34,13 @@ MAX_RETRIES = 3 # pytdx 连接重试次数，尝试 3 次
 # pytdx 周期映射: 9:日线, 5:周线, 6:月线, 8:1分钟
 TDX_FREQ_MAP = {'D': 9, 'W': 5, 'M': 6}
 
-# --- 动态 IP 获取函数 ---
+# --- 动态 IP 获取函数 (已修正，仅使用稳定列表) ---
 
 def get_best_servers(num_servers=5):
-    """动态获取最佳 pytdx 服务器列表（优先使用 best_ip，然后使用备用列表）"""
-    # 备用列表
-    fallback_servers = [
+    """直接返回稳定的 pytdx 服务器备用列表，避免 best_ip 带来的不稳定性。"""
+    
+    # 社区推荐的稳定备用列表（优先级高）
+    stable_servers = [
         ('114.80.149.19', 7709),    # 华泰证券
         ('114.80.149.22', 7709),    # 华泰备用
         ('114.80.149.84', 7709),    # 华泰备用
@@ -49,29 +50,13 @@ def get_best_servers(num_servers=5):
         ('123.125.108.23', 7709),  # 中金公司
         ('180.153.18.17', 7709),    # 招商证券
         ('121.36.81.195', 7709),    # 社区推荐（2025 更新）
-        ('124.71.187.122', 7709),  # 备用（需测试）
+        ('124.71.187.122', 7709),  # 备用
+        ('119.147.212.81', 7721),  # 通用备用端口
+        ('119.147.212.81', 7709),  # 通用主用端口
     ]
     
-    try:
-        best = best_ip.select_best_ip()
-        
-        if best and best.get('ip'):
-            logger.info(f"    - 自动挑选最佳 IP: {best['ip']}:{best['port']}")
-            servers = [(best['ip'], best['port'])]
-            count = 1
-            # 从备用列表中添加，并排除已选最佳 IP
-            for ip, port in fallback_servers:
-                if ip != best['ip'] and count < num_servers:
-                    servers.append((ip, port))
-                    count += 1
-            return servers
-        else:
-            logger.warning("    - best_ip 失败或返回为空，使用备用列表")
-            return fallback_servers[:num_servers]
-            
-    except Exception as e:
-        logger.error(f"    - 获取最佳 IP 失败: {e}，使用内置备用")
-        return fallback_servers[:num_servers] # 即使失败，也使用前 N 个备用 IP
+    logger.info("    - 绕过 pytdx best_ip 自动选择功能，使用硬编码的稳定 IP 列表。")
+    return stable_servers[:num_servers]
 
 # 定义所有主要 A 股指数列表
 INDEX_LIST = {
@@ -95,7 +80,7 @@ INDEX_LIST = {
     '399306': {'name': '深证ETF指数', 'market': 0},
 }
 
-# --- 行业指数代码和市场判断逻辑 ---
+# --- 行业指数代码和市场判断逻辑 (保持不变) ---
 
 SW_INDUSTRY_DICT = {'801010':'农林牧渔','801020':'采掘','801030':'化工','801040':'钢铁','801050':'有色金属',
                     '801080':'电子','801110':'家用电器','801120':'食品饮料','801130':'纺织服装','801140':'轻工制造',
@@ -117,10 +102,7 @@ WIND_INDUSTRY_DICT = {'882002':'材料', '882001':'能源','882003':'工业','88
                       '882010':'公用事业', '882011':'房地产'}
 
 def get_pytdx_market(code):
-    """
-    根据指数代码规则判断 pytdx 所需的市场代码。
-    市场代码：1 (上证)，0 (深证)。
-    """
+    """根据指数代码规则判断 pytdx 所需的市场代码。"""
     code = str(code)
     # 上证指数代码：000xxx, 88xxxx, 801xxx, CI005xxx
     if code.startswith('00') or code.startswith('88') or code.startswith('801') or code.startswith('CI005'):
@@ -171,6 +153,9 @@ def connect_tdx_api(servers):
                 return api
         except TdxConnectionError:
             logger.warning(f"    - 连接失败: {ip}:{port}")
+        except Exception as e:
+            logger.error(f"    - 连接 {ip}:{port} 时发生意外错误: {e}")
+            
     return None
 
 # --- 指标计算函数 (保持不变) ---
@@ -181,7 +166,7 @@ def calculate_full_technical_indicators(df):
         return df
     
     df = df.set_index('date')
-    # ... (计算逻辑与之前版本相同)
+    # 使用 pandas_ta 计算指标
     df.ta.sma(length=5, append=True, col_names=('MA5',))
     df.ta.sma(length=20, append=True, col_names=('MA20',))
     df.ta.rsi(length=14, append=True, col_names=('RSI14',))
@@ -204,15 +189,13 @@ def calculate_full_technical_indicators(df):
 
 
 def aggregate_and_analyze(df_raw_slice, freq, prefix):
-    """按频率聚合数据并计算指标 (pytdx 原始数据没有 turnover_rate)"""
+    """按频率聚合数据并计算指标"""
     if df_raw_slice.empty:
         return pd.DataFrame()
         
-    # pytdx 原始数据没有 turnover_rate，这里为了兼容性，简单将其设置为 NaN
-    df_raw_slice['turnover_rate'] = float('nan')
+    df_raw_slice['turnover_rate'] = float('nan') # 占位
     
-    # 按照 pytdx 数据的日期字段进行重采样
-    # 注意：需要先将 index 转换为 datetime
+    # 将 index 转换为 datetime 用于 resample
     df_raw_slice.index = pd.to_datetime(df_raw_slice.index)
     
     agg_df = df_raw_slice.resample(freq).agg({
@@ -235,12 +218,10 @@ def aggregate_and_analyze(df_raw_slice, freq, prefix):
 # --- 增量数据获取与分析核心函数 (使用 pytdx 分页) ---
 
 def get_full_history_data(api, market, code, freq):
-    """
-    使用 pytdx 分页获取完整的历史 K 线数据。
-    """
+    """使用 pytdx 分页获取完整的历史 K 线数据。"""
     all_data = []
     
-    # 从最新的数据开始往前分页获取
+    # 从最新的数据开始往前分页获取 (安全限制 50000 条)
     for start in range(0, 50000, 800): 
         try:
             data = api.get_security_bars(freq, market, code, start, 800)
@@ -267,7 +248,6 @@ def get_full_history_data(api, market, code, freq):
         df_combined.drop_duplicates(subset=['datetime'], keep='first', inplace=True)
         df_combined.sort_values(by='datetime', inplace=True)
         
-        # 格式化日期：这里使用 datetime 字段并提取 date 部分
         df_combined['date'] = pd.to_datetime(df_combined['datetime']).dt.date
         df_combined.set_index('date', inplace=True)
         
@@ -276,9 +256,7 @@ def get_full_history_data(api, market, code, freq):
 
 
 def get_and_analyze_data_slice(api, market, code, start_date):
-    """
-    获取数据切片 (pytdx 是全量获取后本地筛选)。
-    """
+    """获取数据切片，包括全量获取、本地筛选和指标计算。"""
     logger.info(f"    - 正在获取 {code} (pytdx 接口) 全量数据...")
 
     try:
@@ -308,8 +286,8 @@ def get_and_analyze_data_slice(api, market, code, start_date):
         
         # 5. 周/月/年指标聚合计算
         df_raw.reset_index(inplace=True)
-        df_raw['turnover_rate'] = float('nan') # 占位
-        df_raw.set_index('date', inplace=True) # 重设 index 为 date 对象
+        df_raw['turnover_rate'] = float('nan') 
+        df_raw.set_index('date', inplace=True)
         
         daily_cols = df_daily.columns.drop(['date', 'open', 'close', 'high', 'low', 'volume', 'turnover_rate'])
         df_daily = df_daily.rename(columns={col: f'{col}_D' for col in daily_cols})
@@ -354,6 +332,7 @@ def process_single_index(api, code_map):
             if not df_old.empty:
                 latest_date_in_repo = df_old.index.max()
                 
+                # 往前推 INDICATOR_LOOKBACK_DAYS 天，确保有足够数据计算指标
                 start_date_for_calc = latest_date_in_repo - timedelta(days=INDICATOR_LOOKBACK_DAYS)
                 start_date_to_request = start_date_for_calc.strftime('%Y-%m-%d')
                 
@@ -374,7 +353,6 @@ def process_single_index(api, code_map):
     df_new_analyzed = get_and_analyze_data_slice(api, market, code, start_date_to_request)
     
     if df_new_analyzed is None:
-        # 简单判断是否已经是今天的最新数据（如果获取不到数据，且旧数据是今天，则跳过）
         today = datetime.now(shanghai_tz).date()
         if not df_old.empty and df_old.index.max().date() == today:
             logger.info(f"    - {code} 数据已是今天最新，跳过保存。")
@@ -413,7 +391,7 @@ def main():
     
     # 2. 连接 pytdx API（动态服务器）
     tdx_api = None
-    servers = get_best_servers(5)  # 获取 5 个最佳服务器
+    servers = get_best_servers(5)  # 获取 5 个稳定服务器
     logger.info(f"    - 使用服务器列表: {servers}")
     
     for attempt in range(MAX_RETRIES):
