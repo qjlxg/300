@@ -1,4 +1,4 @@
-# stock_analysis_pytdx_production.py - 最终 pytdx (通达信) 稳定版
+# stock_analysis_pytdx_production.py - 最终 pytdx (通达信) 稳定版 (动态 IP)
 
 import pandas as pd
 import pandas_ta as ta
@@ -9,8 +9,8 @@ import time
 
 # --- 新增 pytdx 依赖 ---
 from pytdx.hq import TdxHq_API
-from pytdx.exhq import TdxExHq_API
-from pytdx.util import best_ip
+# from pytdx.exhq import TdxExHq_API # 未使用，保留原代码注释掉
+from pytdx.util import best_ip # <-- 新增：用于动态获取 IP
 from pytdx.errors import TdxConnectionError
 
 # --- 顶部新增导入 ---
@@ -31,11 +31,55 @@ LOCK_FILE = "stock_analysis.lock"
 MAX_WORKERS = 1 
 MAX_RETRIES = 3 # pytdx 连接重试次数，尝试 3 次
 
-# 通达信服务器 IP 和端口
-TDX_SERVERS = [
-    ('119.147.212.81', 7709), 
-    ('119.147.212.81', 7721)  
-]
+# --- 新增：动态 IP 获取函数 ---
+
+def get_best_servers(num_servers=5):
+    """动态获取最佳 pytdx 服务器列表（2025 年可用 IP）"""
+    # 备用列表（从 2025 年社区更新中提取的可用 IP，优先级高）
+    fallback_servers = [
+        ('114.80.149.19', 7709),    # 华泰证券
+        ('114.80.149.22', 7709),    # 华泰备用
+        ('114.80.149.84', 7709),    # 华泰备用
+        ('114.80.80.222', 7709),    # 国金证券
+        ('115.238.56.198', 7709),  # 新时代
+        ('119.147.164.60', 7709),  # 广发证券
+        ('123.125.108.23', 7709),  # 中金公司
+        ('180.153.18.17', 7709),    # 招商证券
+        ('121.36.81.195', 7709),    # 社区推荐（2025 更新）
+        ('124.71.187.122', 7709),  # 备用（需测试）
+    ]
+    
+    try:
+        # 使用 pytdx 内置 best_ip 自动挑选最佳（延迟最低的）
+        best = best_ip.select_best_ip()
+        
+        if best and best.get('ip'):
+            logger.info(f"    - 自动挑选最佳 IP: {best['ip']}:{best['port']}")
+            # 优先用 best_ip，然后使用备用列表
+            servers = [(best['ip'], best['port'])]
+            count = 1
+            for ip, port in fallback_servers:
+                if ip != best['ip'] and count < num_servers:
+                    servers.append((ip, port))
+                    count += 1
+            return servers
+        else:
+            logger.warning("    - best_ip 失败或返回为空，使用备用列表")
+            return fallback_servers[:num_servers]
+            
+    except Exception as e:
+        logger.error(f"    - 获取最佳 IP 失败: {e}，使用内置备用")
+        # 兜底内置备用列表
+        return [
+            ('114.80.149.19', 7709),
+            ('114.80.149.22', 7709),
+            ('119.147.164.60', 7709),
+            ('180.153.18.17', 7709),
+            ('123.125.108.23', 7709)
+        ][:num_servers]
+
+# 删除了硬编码的 TDX_SERVERS 常量
+
 # pytdx 周期映射: 9:日线, 5:周线, 6:月线, 8:1分钟
 TDX_FREQ_MAP = {'D': 9, 'W': 5, 'M': 6}
 
@@ -61,7 +105,7 @@ INDEX_LIST = {
     '399306': {'name': '深证ETF指数', 'market': 0},
 }
 
-# --- 新增：行业指数代码和市场判断逻辑 (来自用户输入) ---
+# --- 行业指数代码和市场判断逻辑 ---
 
 SW_INDUSTRY_DICT = {'801010':'农林牧渔','801020':'采掘','801030':'化工','801040':'钢铁','801050':'有色金属',
                     '801080':'电子','801110':'家用电器','801120':'食品饮料','801130':'纺织服装','801140':'轻工制造',
@@ -382,10 +426,13 @@ def main():
         return
     lock_file_path.touch() 
     
-    # 2. 连接 pytdx API
+    # 2. 连接 pytdx API（修改：动态服务器）
     tdx_api = None
+    servers = get_best_servers(5)  # 获取 5 个最佳服务器
+    logger.info(f"    - 使用服务器列表: {servers}")
+    
     for attempt in range(MAX_RETRIES):
-        tdx_api = connect_tdx_api(TDX_SERVERS)
+        tdx_api = connect_tdx_api(servers)  # 传入动态列表
         if tdx_api:
             break
         if attempt < MAX_RETRIES - 1:
@@ -440,7 +487,8 @@ def main():
 
     finally:
         # 7. 移除锁文件并断开连接
-        tdx_api.close()
+        if tdx_api:
+            tdx_api.close()
         lock_file_path.unlink(missing_ok=True)
         logger.info("pytdx 连接已关闭，锁文件已清除。")
 
