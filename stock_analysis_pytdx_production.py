@@ -1,4 +1,4 @@
-# stock_analysis_akshare_production.py - V8 AkShare 稳定版 (含重试和延迟)
+# stock_analysis_akshare_production.py - V9 终极稳定版 (强化超时与延迟)
 
 import pandas as pd
 import pandas_ta as ta
@@ -18,18 +18,28 @@ import warnings
 warnings.filterwarnings("ignore")
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
-# --- 常量和配置 ---
+
+# --- AkShare 全局配置 (V9 核心改进 1: 设置全局超时) ---
+# 强制设置全局请求超时时间为 30 秒
+try:
+    ak.set_time_out(30)
+except Exception as e:
+    # 兼容性处理
+    print(f"警告：设置 AkShare 全局超时失败：{e}")
+
+
+# --- 常量和配置 (V9 核心改进 2: 提高基础延迟) ---
 shanghai_tz = pytz.timezone('Asia/Shanghai')
 OUTPUT_DIR = "index_data" 
 DEFAULT_START_DATE = '2000-01-01' 
-INDICATOR_LOOKBACK_DAYS = 30 # 用于确保重叠数据能够覆盖指标计算所需的历史数据
+INDICATOR_LOOKBACK_DAYS = 30 
 LOCK_FILE = "stock_analysis.lock" 
 
-MAX_WORKERS = 1 # 强烈建议保持为1，避免AkShare请求过于频繁导致被封
+MAX_WORKERS = 1 # 保持为1，确保串行
 MAX_RETRIES = 5 # 最大的重试次数
-BASE_DELAY = 5   # 基础延迟（秒）
+BASE_DELAY = 10  # 基础延迟提高到 10 秒
 
-# --- 指数列表及代码结构 ---
+# --- 指数列表及代码结构 (保持不变) ---
 
 INDEX_LIST = {
     '000001': {'name': '上证指数', 'market': 1}, 
@@ -54,8 +64,8 @@ INDEX_LIST = {
 
 # 申万行业指数 (中信/万得暂时禁用，AkShare申万接口相对稳定，但仍需谨慎)
 SW_INDUSTRY_DICT = {'801010':'农林牧渔','801020':'采掘','801030':'化工','801040':'钢铁','801050':'有色金属','801080':'电子','801110':'家用电器','801120':'食品饮料','801130':'纺织服装','801140':'轻工制造','801150':'医药生物','801160':'公用事业','801170':'交通运输','801180':'房地产','801200':'商业贸易','801210':'休闲服务','801230':'综合','801710':'建筑材料','801720':'建筑装饰','801730':'电气设备','801740':'国防军工','801750':'计算机','801760':'传媒','801770':'通信','801780':'银行','801790':'非银金融','801880':'汽车','801890':'机械设备','801060':'建筑建材','801070':'机械设备','801090':'交运设备','801190':'金融服务','801100':'信息设备','801220':'信息服务'}
-CS_INDUSTRY_DICT = {} # 禁用中信
-WIND_INDUSTRY_DICT = {} # 禁用万得
+CS_INDUSTRY_DICT = {} 
+WIND_INDUSTRY_DICT = {} 
 
 def get_pytdx_market(code): 
     code = str(code)
@@ -79,7 +89,7 @@ INDEX_LIST = merge_industry_indexes(INDEX_LIST, SW_INDUSTRY_DICT, prefix="申万
 INDEX_LIST = merge_industry_indexes(INDEX_LIST, CS_INDUSTRY_DICT, prefix="中信一级_")
 INDEX_LIST = merge_industry_indexes(INDEX_LIST, WIND_INDUSTRY_DICT, prefix="万得一级_")
 
-# --- 配置日志系统 ---
+# --- 配置日志系统 (保持不变) ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
@@ -91,23 +101,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# --- 指标计算函数 (使用 pandas_ta) ---
+# --- 指标计算函数 (保持不变) ---
 
 def calculate_full_technical_indicators(df):
     """计算完整的技术指标集：MA, RSI, KDJ, MACD, BBANDS, ATR, CCI, OBV"""
     if df.empty:
         return df
     
-    # 强制将 date 列设置为索引，确保它是 DatetimeIndex
     df['date'] = pd.to_datetime(df['date'])
     df = df.set_index('date')
     
-    # 确保价格和成交量列是数字类型
     price_cols = ['open', 'close', 'high', 'low', 'volume']
     for col in price_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce')
     
-    # 指标计算 
     df.ta.sma(length=5, append=True, col_names=('MA5',))
     df.ta.sma(length=20, append=True, col_names=('MA20',))
     df.ta.rsi(length=14, append=True, col_names=('RSI14',))
@@ -131,10 +138,8 @@ def aggregate_and_analyze(df_raw_slice, freq, prefix):
     if df_raw_slice.empty:
         return pd.DataFrame()
         
-    # AkShare指数数据不提供换手率，强制添加nan列
     df_raw_slice['turnover_rate'] = float('nan') 
     
-    # 将 index 强制转为 datetime 对象 index，以便 resample
     df_raw_slice.index = pd.to_datetime(df_raw_slice.index)
     
     agg_df = df_raw_slice.resample(freq).agg({
@@ -145,18 +150,16 @@ def aggregate_and_analyze(df_raw_slice, freq, prefix):
     if not agg_df.empty:
         agg_df = agg_df.reset_index().rename(columns={'index': 'date'})
         
-        # 强制将 datetime 转换为 date 对象，保持格式一致性
         agg_df['date'] = agg_df['date'].dt.date 
         agg_df = calculate_full_technical_indicators(agg_df)
         
         cols_to_keep = agg_df.columns.drop(['date', 'open', 'close', 'high', 'low', 'volume', 'turnover_rate'])
-        agg_df = agg_df[['date'] + cols_to_keep.tolist()]
         agg_df = agg_df.rename(columns={col: f'{col}_{prefix}' for col in cols_to_keep})
         agg_df.set_index('date', inplace=True)
         
     return agg_df
 
-# --- 增量数据获取与分析核心函数 (使用 AkShare V8 - 带重试/延迟) ---
+# --- 增量数据获取与分析核心函数 (使用 AkShare V9 - 强化重试/延迟) ---
 
 def get_full_history_data(code, start_date_str):
     """
@@ -167,7 +170,6 @@ def get_full_history_data(code, start_date_str):
     for attempt in range(MAX_RETRIES):
         try:
             if code.startswith('801'):
-                # AkShare 申万一级行业指数接口 - 暂时禁用，若需要，需查AkShare最新接口
                 logger.warning(f"    - 警告：AkShare 行业指数 {code} 接口复杂或不稳定，跳过。")
                 return pd.DataFrame()
             else:
@@ -192,20 +194,16 @@ def get_full_history_data(code, start_date_str):
                 '成交量': 'volume'
             }, inplace=True)
             
-            # 仅保留核心列
             df = df[['date', 'open', 'close', 'high', 'low', 'volume']].copy()
 
-            # 确保日期是 DatetimeIndex 供后续处理
             df['date'] = pd.to_datetime(df['date'])
             df.set_index('date', inplace=True)
             
-            # 确保列是 float 类型
             for col in ['open', 'close', 'high', 'low', 'volume']:
                  df[col] = pd.to_numeric(df[col], errors='coerce')
 
             df.dropna(subset=['close'], inplace=True)
             
-            # 将 DatetimeIndex 转换为 Date 对象 Index (用于与旧数据索引类型统一)
             df.index = df.index.date
             df.sort_index(inplace=True)
 
@@ -217,6 +215,7 @@ def get_full_history_data(code, start_date_str):
             logger.warning(f"    - AkShare 获取 {code} 失败 (尝试 {attempt + 1}/{MAX_RETRIES})。错误: {e}")
             if attempt < MAX_RETRIES - 1:
                 # 增加等待时间，并乘以尝试次数，实现指数退避
+                # V9 等待时间：10s, 12s, 14s, 16s, 18s
                 wait_time = BASE_DELAY + attempt * 2 
                 logger.info(f"    - 正在等待 {wait_time} 秒后重试...")
                 time.sleep(wait_time)
@@ -229,7 +228,6 @@ def get_and_analyze_data_slice(code, start_date):
     """获取数据切片，包括全量获取、本地筛选和指标计算。"""
     
     try:
-        # 1. 全量获取数据 (带重试)
         df_full = get_full_history_data(code, start_date)
 
         if df_full.empty:
@@ -238,24 +236,17 @@ def get_and_analyze_data_slice(code, start_date):
             
         df_raw = df_full.copy()
         
-        # 2. 准备指标计算
         df_raw_processed = df_raw.reset_index().rename(columns={'index': 'date'})
-
-        # 核心修正：确保日期是 datetime 类型
         df_raw_processed['date'] = pd.to_datetime(df_raw_processed['date']) 
         
-        # 3. 指标计算
         df_daily = calculate_full_technical_indicators(df_raw_processed.copy())
         
-        # 4. 周/月/年指标聚合计算
-        # 准备用于 resample 的 df_raw，需要 DatetimeIndex
         df_raw.index = pd.to_datetime(df_raw.index)
         
         daily_cols = df_daily.columns.drop(['date', 'open', 'close', 'high', 'low', 'volume'])
         df_daily = df_daily.rename(columns={col: f'{col}_D' for col in daily_cols})
         df_daily.set_index('date', inplace=True)
         
-        # 聚合和合并
         df_weekly = aggregate_and_analyze(df_raw, 'W', 'W')
         df_monthly = aggregate_and_analyze(df_raw, 'M', 'M')
         df_yearly = aggregate_and_analyze(df_raw, 'Y', 'Y')
@@ -289,12 +280,10 @@ def process_single_index(code_map):
     # 1. 确定本次下载的起始日期 
     if output_path.exists():
         try:
-            # parse_dates=True 将索引读为 DatetimeIndex
             df_old = pd.read_csv(output_path, index_col='date', parse_dates=True)
             if not df_old.empty:
                 latest_date_in_repo = df_old.index.max()
                 
-                # 请求的起始日期需要包含指标计算所需的历史数据 (30天重叠)
                 start_date_for_calc = latest_date_in_repo - timedelta(days=INDICATOR_LOOKBACK_DAYS)
                 start_date_to_request = start_date_for_calc.strftime('%Y-%m-%d')
                 
@@ -315,10 +304,8 @@ def process_single_index(code_map):
     df_new_analyzed = get_and_analyze_data_slice(code, start_date_to_request)
     
     if df_new_analyzed is None:
-        # 如果获取失败，检查旧数据是否已更新到今天
         is_today_updated = False
         if not df_old.empty and pd.api.types.is_datetime64_any_dtype(df_old.index):
-             # 统一将索引转换为日期进行比较
              today = datetime.now(shanghai_tz).date()
              is_today_updated = df_old.index.max().date() == today
         
@@ -330,22 +317,16 @@ def process_single_index(code_map):
 
     # 3. 整合新旧数据 
     if not df_old.empty:
-        # df_old 的索引是 DatetimeIndex，而 df_new_analyzed 索引是 Date 对象。
-        # 这里统一将 df_old 索引转换为 Date 对象进行比较。
         df_old.index = df_old.index.date
-        
-        # 保留旧数据中，日期在新的分析数据最早日期之前的部分 (即非重叠部分)
         old_data_to_keep = df_old[df_old.index < df_new_analyzed.index.min()]
     else:
         old_data_to_keep = pd.DataFrame()
         
-    # 合并前，将索引统一转换回 DatetimeIndex 
     df_new_analyzed.index = pd.to_datetime(df_new_analyzed.index)
     old_data_to_keep.index = pd.to_datetime(old_data_to_keep.index)
 
 
     df_combined = pd.concat([old_data_to_keep, df_new_analyzed])
-    # 去重（保留最新的），并排序
     results_to_save = df_combined[~df_combined.index.duplicated(keep='last')]
     results_to_save = results_to_save.sort_index()
 
@@ -360,7 +341,6 @@ def main():
     start_time = time.time()
     output_path = Path(OUTPUT_DIR)
     
-    # 1. 检查运行锁
     lock_file_path = Path(LOCK_FILE)
     if lock_file_path.exists():
         logger.warning("检测到锁文件，脚本可能正在运行或上次异常退出。终止本次运行。")
@@ -368,10 +348,9 @@ def main():
     lock_file_path.touch() 
     
     logger.info("—" * 50)
-    logger.info("🚀 脚本开始运行 (使用 AkShare V8 - 稳定版)")
+    logger.info("🚀 脚本开始运行 (使用 AkShare V9 - 终极稳定版)")
     
     try:
-        # 2. 初始化目录
         output_path.mkdir(exist_ok=True) 
         logger.info(f"结果将保存到专用目录: {output_path.resolve()}")
         logger.info(f"准备串行处理 {len(INDEX_LIST)} 个指数...")
@@ -379,10 +358,8 @@ def main():
         successful = 0
         failed = 0
         
-        # 3. 转换 INDEX_LIST 格式以方便处理
         jobs = [{'code': code, **data} for code, data in INDEX_LIST.items()]
         
-        # 4. 使用 ThreadPoolExecutor 进行串行处理 (MAX_WORKERS = 1)
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             
             futures = {
@@ -404,13 +381,11 @@ def main():
         end_time = time.time()
         elapsed_time = end_time - start_time
         
-        # 5. 最终统计和输出
         logger.info("—" * 50)
         logger.info(f"✅ 所有指数数据处理完成。总耗时: {elapsed_time:.2f} 秒")
         logger.info(f"统计：成功更新 {successful} 个文件，失败/跳过 {failed} 个。")
 
     finally:
-        # 6. 移除锁文件
         lock_file_path.unlink(missing_ok=True)
         logger.info("锁文件已清除。")
 
