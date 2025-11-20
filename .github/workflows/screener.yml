@@ -1,10 +1,12 @@
 name: Stock Screener Workflow
 
 on:
+  # 当 stock_screener_with_etf.py 或 workflow 文件本身被 push 时触发
   push:
     paths:
       - 'stock_screener_with_etf.py'
       - '.github/workflows/screener.yml'
+  # 允许手动触发
   workflow_dispatch:
 
 jobs:
@@ -12,35 +14,49 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        # 需要获取完整的提交历史才能正确推送到分支
+        with:
+          fetch-depth: 0
 
-      - name: Set up Python
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Install dependencies
-        run: pip install akshare pandas pandas_ta
+      - name: Install dependencies (新增 tenacity) 📦
+        # 增加 tenacity 以处理连接重试
+        run: pip install akshare pandas pandas_ta tenacity requests
 
-      - name: Run screener script
+      - name: Run screener script 🚀
+        # 脚本如果因网络错误失败，会被 tenacity 自动重试
         run: python stock_screener_with_etf.py
 
-      - name: Set Shanghai timezone and generate timestamp
+      - name: Set Shanghai timezone and generate timestamp ⏰
         run: |
+          # 确保时区设置为上海/北京时间
           export TZ='Asia/Shanghai'
           timestamp=$(date +%Y%m%d_%H%M%S)
           year_month=$(date +%Y/%m)
           echo "TIMESTAMP=$timestamp" >> $GITHUB_ENV
           echo "YEAR_MONTH=$year_month" >> $GITHUB_ENV
 
-      - name: Move and rename result file
+      - name: Move and rename result file 📁
+        # 将结果文件移动到按年月组织的文件夹中
         run: |
-          mkdir -p ${{ env.YEAR_MONTH }}
-          mv screened_stocks_etf.csv ${{ env.YEAR_MONTH }}/screened_stocks_etf_${{ env.TIMESTAMP }}.csv
+          # 检查文件是否存在，如果脚本失败或没有结果文件则跳过
+          if [ -f "screened_stocks_etf.csv" ]; then
+            mkdir -p ${{ env.YEAR_MONTH }}
+            mv screened_stocks_etf.csv ${{ env.YEAR_MONTH }}/screened_stocks_etf_${{ env.TIMESTAMP }}.csv
+          else
+            echo "未找到 screened_stocks_etf.csv 文件，可能今日没有符合条件的标的。"
+          fi
 
-      - name: Commit and push results
+      - name: Commit and push results 📤
+        # 使用 git 提交和推送结果
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           git add .
+          # 使用 '|| true' 或 '|| echo ...' 确保即使没有变化，步骤也不会失败
           git commit -m "Add screened stocks ETF results for ${{ env.TIMESTAMP }}" || echo "No changes to commit"
           git push
