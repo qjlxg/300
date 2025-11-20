@@ -2,7 +2,7 @@
 # 小资金A股股票+ETF筛选器：基于MACD/RSI/突破/放量，低价股/ETF（2-20元），放松MACD到3日过滤
 # 适合1.5万本金、低耐心用户，中频短线/波段策略
 # 作者：Grok（基于用户需求生成）
-# 更新：加入ETF筛选（价格2-20元，名称含ETF），并加入连接重试机制（tenacity）
+# 更新：加入ETF筛选，多线程并行加速，并加入连接重试机制（tenacity）
 # 使用：python stock_screener_with_etf.py
 # 输出：符合条件的股票/ETF列表
 
@@ -11,11 +11,13 @@ import pandas as pd
 import pandas_ta as ta
 import datetime
 import numpy as np
-# 引入 tenacity 用于处理网络连接重试
+import requests
+import concurrent.futures # 🚀 用于多线程加速
 from tenacity import retry, stop_after_attempt, wait_exponential
-import requests # 确保 requests 可用，tenacity可能依赖它来捕获ConnectionError
 
-# 配置（调整价格范围适合ETF）
+# =========================================================
+# 配置
+# =========================================================
 MIN_PRICE = 2.0  # 最低价（ETF多低价）
 MAX_PRICE = 20.0  # 最高价
 DAYS = 120  # 历史数据天数
@@ -25,14 +27,16 @@ BREAKOUT_MULT = 1.01  # 突破前高倍数
 DAILY_RETURN_MIN = 0.015  # 当日涨幅>1.5%
 RSI_MIN = 65  # RSI>65（强势）
 AVOID_BOARDS = ['688', '300']  # 避开科创/创业板股票（ETF不受影响）
+MAX_WORKERS = 32 # 🚀 多线程数，用于加速数据获取，可根据需要调整 (32-64)
+
+# =========================================================
+# 数据获取 (含重试)
+# =========================================================
 
 # 使用 @retry 装饰器处理网络连接错误
 @retry(
-    # 尝试 5 次
     stop=stop_after_attempt(5),
-    # 使用指数退避等待时间：2s, 4s, 8s, 16s...
     wait=wait_exponential(multiplier=1, min=2, max=30),
-    # 捕获requests库的ConnectionError（包括底层的ProtocolError）进行重试
     retry=(requests.exceptions.ConnectionError) 
 )
 def get_stock_list():
@@ -44,42 +48,66 @@ def get_stock_list():
 def get_stock_data(code, days=DAYS):
     """获取单只股票/ETF历史数据"""
     try:
-        df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=(datetime.date.today() - datetime.timedelta(days=days*2)).strftime("%Y%m%d"), end_date=datetime.date.today().strftime("%Y%m%d"), adjust="qfq")
+        # 只请求所需数据日期范围，减少网络负载
+        start_date_str = (datetime.date.today() - datetime.timedelta(days=days*2)).strftime("%Y%m%d")
+        end_date_str = datetime.date.today().strftime("%Y%m%d")
+        df = ak.stock_zh_a_hist(
+            symbol=code, 
+            period="daily", 
+            start_date=start_date_str, 
+            end_date=end_date_str, 
+            adjust="qfq"
+        )
         df = df[['日期', '开盘', '收盘', '最高', '最低', '成交量']]
         df.columns = ['Date', 'Open', 'Close', 'High', 'Low', 'Volume']
         df['Date'] = pd.to_datetime(df['Date'])
         df.sort_values('Date', inplace=True)
-        return df
-    except:
+        return df.iloc[-DAYS:] # 只保留最近 DAYS 天的数据用于计算
+    except Exception as e:
+        # print(f"获取 {code} 数据失败: {e}")
         return pd.DataFrame()
+
+# =========================================================
+# 指标计算与筛选逻辑
+# =========================================================
 
 def calculate_indicators(df):
     """计算指标：MA、MACD、RSI、Volume MA"""
     if len(df) < 60:
         return df
-    df['MA5'] = ta.sma(df['Close'], length=5)
-    df['MA20'] = ta.sma(df['Close'], length=20)
-    macd = ta.macd(df['Close'], fast=12, slow=26, signal=9)
-    df['DIF'] = macd['MACD_12_26_9']
-    df['RSI'] = ta.rsi(df['Close'], length=14)
+    
+    # 尽可能使用 pandas_ta 的内置功能来提高性能
+    df.ta.macd(append=True)
+    df.rename(columns={'MACD_12_26_9': 'DIF'}, inplace=True) # 使用 DIF 命名保持一致性
+    df.ta.rsi(append=True)
+    df.rename(columns={'RSI_14': 'RSI'}, inplace=True) 
+    
     df['MA5V'] = ta.sma(df['Volume'], length=5)
-    df['Max_High_20'] = df['High'].rolling(20).max().shift(1)  # 前20日最高
+    # 前20日最高价，并使用 shift(1) 确保不包含当日高点
+    df['Max_High_20'] = df['High'].rolling(20).max().shift(1) 
     return df
 
 def check_conditions(df, code, name):
     """检查筛选条件，返回信号类型或None"""
-    if df.empty or len(df) < DAYS:
+    
+    # 确保有足够的指标数据，至少 DAYS 天 + 26 天指标计算窗口
+    if df.empty or len(df) < 60:
         return None
-    df = calculate_indicators(df) # 确保计算了指标
+
     latest = df.iloc[-1]
     prev = df.iloc[-2] if len(df) > 1 else None
 
-    # 价格过滤：2-20元，非科创/创业股票（ETF自动包括）
-    # 注意：这里需要确保 latest['Close'] 和 Max_High_20 有值
+    # 检查计算结果是否是 NaN (可能是数据量不足导致的)
     if pd.isna(latest['Close']) or pd.isna(latest['RSI']) or pd.isna(latest['DIF']):
         return None
-    
-    if not (MIN_PRICE <= latest['Close'] <= MAX_PRICE) or any(code.startswith(board) for board in AVOID_BOARDS if not ('ETF' in name.upper())):
+        
+    # 价格过滤：2-20元，非科创/创业股票
+    is_etf = 'ETF' in name.upper() or code.startswith(('51', '15', '56')) # 增加ETF代码前缀识别
+    if not (MIN_PRICE <= latest['Close'] <= MAX_PRICE):
+        return None
+        
+    # 避开科创/创业板股票 (ETF不受影响)
+    if not is_etf and any(code.startswith(board) for board in AVOID_BOARDS):
         return None
 
     # 当日涨幅>1.5%
@@ -91,6 +119,7 @@ def check_conditions(df, code, name):
         return None
 
     # MACD 3日>0轴
+    # 检查 MACD_DAYS 天的 DIF 都是正数
     if len(df) < MACD_DAYS or not all(df['DIF'].tail(MACD_DAYS) > 0):
         return None
 
@@ -102,9 +131,9 @@ def check_conditions(df, code, name):
     if pd.isna(latest['Max_High_20']) or latest['Close'] <= latest['Max_High_20'] * BREAKOUT_MULT:
         return None
 
-    # 额外：检查是否有近期大涨（ETF用>5%模拟涨停）
+    # 额外：检查是否有近期大涨 (ETF用>5%模拟涨停)
     had_big_rise = False
-    limit_threshold = 0.05  # ETF少涨停，用5%+
+    limit_threshold = 0.05
     # 检查前6个交易日（不含今日）
     for i in range(-6, -1):
         if len(df) + i >= 0 and len(df) + i - 1 >= 0:
@@ -114,8 +143,6 @@ def check_conditions(df, code, name):
                 had_big_rise = True
                 break
 
-    # 判断是股票还是ETF
-    is_etf = 'ETF' in name.upper() or '易方达' in name or '华夏' in name or '南方' in name # 增强ETF识别
     signal = "突破放量强势股" if not is_etf else "突破放量强势ETF"
     if had_big_rise:
         signal = ("龙头二次启动" if not is_etf else "ETF二次启动")
@@ -123,7 +150,7 @@ def check_conditions(df, code, name):
     return {
         '代码': code,
         '名称': name,
-        '当前价': latest['Close'],
+        '当前价': round(latest['Close'], 2),
         '信号类型': signal,
         'RSI': round(latest['RSI'], 2),
         'DIF': round(latest['DIF'], 3),
@@ -131,46 +158,63 @@ def check_conditions(df, code, name):
         '类型': 'ETF' if is_etf else '股票'
     }
 
+def process_stock(code, name):
+    """用于多线程处理单个股票/ETF，返回筛选结果或 None"""
+    df = get_stock_data(code)
+    # calculate_indicators 已在 check_conditions 内部调用 (或者在 check_conditions 前调用，取决于您的选择)
+    # 为了避免在多线程中多次计算，这里先计算指标
+    if not df.empty and len(df) >= 60:
+         df = calculate_indicators(df)
+         return check_conditions(df, code, name)
+    return None
+
+# =========================================================
+# 主函数 (多线程并行)
+# =========================================================
+
 def main():
-    print("开始筛选A股股票+ETF...")
+    print("🚀 开始筛选A股股票+ETF (多线程加速中)...")
+    
+    # 1. 获取股票列表 (含重试)
     try:
         stock_list = get_stock_list()
     except requests.exceptions.ConnectionError as e:
         print(f"❌ 严重错误：经过多次重试，仍无法获取股票列表。请检查网络或数据源。错误信息: {e}")
-        # 如果重试后仍失败，主程序退出
         return
         
     results = []
     total_stocks = len(stock_list)
+    print(f"待处理股票/ETF总数: {total_stocks}")
 
-    # 遍历所有（包括ETF）
-    for idx, row in stock_list.iterrows():
-        code = row['代码']
-        name = row['名称']
+    # 2. 使用多线程加速数据获取和筛选
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # 将所有股票/ETF的任务提交给线程池
+        futures = {
+            executor.submit(process_stock, row['代码'], row['名称']): row['代码'] 
+            for _, row in stock_list.iterrows()
+        }
         
-        # 跳过不在价格范围内的股票，提前过滤大部分不符合条件的
-        # (这只是粗略过滤，精确过滤在 check_conditions 中)
-        # if not ('ETF' in name.upper() or code.startswith('51') or code.startswith('15')):
-        #     if code.startswith('688') or code.startswith('300'):
-        #         continue
-                
-        df = get_stock_data(code)
-        
-        # 仅在数据获取成功且足够时才进行计算和检查
-        if not df.empty and len(df) >= DAYS:
-            df = calculate_indicators(df)
-            result = check_conditions(df, code, name)
+        # 实时获取和处理结果
+        processed_count = 0
+        for future in concurrent.futures.as_completed(futures):
+            processed_count += 1
+            result = future.result()
             if result:
                 results.append(result)
                 
-        if (idx + 1) % 500 == 0:
-            print(f"已处理 {idx + 1}/{total_stocks} 只股票/ETF...")
-
+            # 每处理 500 个打印一次进度
+            if processed_count % 500 == 0:
+                print(f"🔄 已处理进度: {processed_count}/{total_stocks}...")
+    
     print(f"✅ 筛选完成。共处理 {total_stocks} 只股票/ETF。")
 
+    # 3. 输出结果
     if results:
         results_df = pd.DataFrame(results)
         results_df.sort_values('涨幅%', ascending=False, inplace=True)
+        # 重新排序并选择最终需要的列，保证输出整洁
+        results_df = results_df[['代码', '名称', '类型', '信号类型', '当前价', '涨幅%', 'RSI', 'DIF']]
+        
         print("\n🎉 符合条件的股票/ETF：")
         print(results_df.to_string(index=False))
         results_df.to_csv('screened_stocks_etf.csv', index=False, encoding='utf-8-sig')
