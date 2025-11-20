@@ -1,0 +1,46 @@
+name: Stock Screener Workflow
+
+on:
+  push:
+    paths:
+      - 'stock_screener_with_etf.py'
+      - '.github/workflows/screener.yml'
+  workflow_dispatch:
+
+jobs:
+  run-screener:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install akshare pandas pandas_ta
+
+      - name: Run screener script
+        run: python stock_screener_with_etf.py
+
+      - name: Set Shanghai timezone and generate timestamp
+        run: |
+          export TZ='Asia/Shanghai'
+          timestamp=$(date +%Y%m%d_%H%M%S)
+          year_month=$(date +%Y/%m)
+          echo "TIMESTAMP=$timestamp" >> $GITHUB_ENV
+          echo "YEAR_MONTH=$year_month" >> $GITHUB_ENV
+
+      - name: Move and rename result file
+        run: |
+          mkdir -p ${{ env.YEAR_MONTH }}
+          mv screened_stocks_etf.csv ${{ env.YEAR_MONTH }}/screened_stocks_etf_${{ env.TIMESTAMP }}.csv
+
+      - name: Commit and push results
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add .
+          git commit -m "Add screened stocks ETF results for ${{ env.TIMESTAMP }}" || echo "No changes to commit"
+          git push
