@@ -1,68 +1,56 @@
-name: Stock Screener Workflow
+# .github/workflows/screener.yml
+name: Stock Screener Ultra Fast
 
 on:
   push:
     paths:
-      - 'stock_screener_with_etf.py'
+      - 'stock_screener_ultra_fast.py'
       - '.github/workflows/screener.yml'
   workflow_dispatch:
+  schedule:
+    - cron: '30 7 * * 1-5'  # 可选：每天北京时间15:30自动跑（开盘后）
 
 jobs:
   run-screener:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
       - uses: actions/checkout@v4
-        # 需要获取完整的提交历史才能正确推送到分支
-        with:
-          fetch-depth: 0
 
-      - name: Set up Python 3.12
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      # 🚀 新增：缓存 Python 依赖，加快后续运行速度
-      - name: Cache Python dependencies
-        uses: actions/cache@v4
-        with:
-          # 缓存路径
-          path: ${{ env.pythonLocation }}/lib/python*/site-packages
-          # 缓存键：基于操作系统、Python版本和脚本文件哈希
-          key: ${{ runner.os }}-python-${{ hashFiles('stock_screener_with_etf.py') }}
-          restore-keys: |
-            ${{ runner.os }}-python-
+      - name: Install & upgrade dependencies
+        run: |
+          pip install --upgrade akshare pandas pandas_ta requests urllib3
 
-      - name: Install dependencies (新增 tenacity, requests, futures) 📦
-        # 确保安装了所有依赖，包括用于加速的 concurrent.futures (虽然它是标准库，但确保 requests 和 tenacity)
-        run: pip install akshare pandas pandas_ta tenacity requests
+      - name: Run ultra fast parallel screener
+        run: python stock_screener_ultra_fast.py
 
-      - name: Run screener script 🚀
-        # 脚本将以多线程方式运行
-        run: python stock_screener_with_etf.py
-
-      - name: Set Shanghai timezone and generate timestamp ⏰
+      - name: Generate Shanghai timestamp & path
         run: |
           export TZ='Asia/Shanghai'
-          timestamp=$(date +%Y%m%d_%H%M%S)
-          year_month=$(date +%Y/%m)
-          echo "TIMESTAMP=$timestamp" >> $GITHUB_ENV
-          echo "YEAR_MONTH=$year_month" >> $GITHUB_ENV
+          TS=$(date +%Y%m%d_%H%M%S)
+          YM=$(date +%Y/%m)
+          echo "TIMESTAMP=$TS" >> $GITHUB_ENV
+          echo "YEAR_MONTH=$YM" >> $GITHUB_ENV
 
-      - name: Move and rename result file 📁
+      - name: Save result with timestamp
         run: |
-          # 检查文件是否存在，如果脚本成功但没有结果文件（即今日无符合条件标的）则跳过
-          if [ -f "screened_stocks_etf.csv" ]; then
-            mkdir -p ${{ env.YEAR_MONTH }}
-            mv screened_stocks_etf.csv ${{ env.YEAR_MONTH }}/screened_stocks_etf_${{ env.TIMESTAMP }}.csv
+          mkdir -p ${{ env.YEAR_MONTH }}
+          if [ -f screened_stocks_etf.csv ]; then
+            mv screened_stocks_etf.csv ${{ env.YEAR_MONTH }}/screened_${{ env.TIMESTAMP }}.csv
           else
-            echo "未找到 screened_stocks_etf.csv 文件，跳过移动。"
+            touch ${{ env.YEAR_MONTH }}/screened_${{ env.TIMESTAMP }}.csv
           fi
 
-      - name: Commit and push results 📤
+      - name: Commit & push
         run: |
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions@users.noreply.github.com"
           git add .
-          # 如果没有变化，不进行 commit，并确保命令不会失败
-          git commit -m "Add screened stocks ETF results for ${{ env.TIMESTAMP }}" || echo "No changes to commit"
+          git commit -m "筛选结果 ${{ env.TIMESTAMP }}" || echo "无变化"
           git push
